@@ -958,6 +958,7 @@ async def build_partitioned_messages(
         result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
     
     # A区：剥离tool消息和tool_calls，只保留有文本的user/assistant（节省上下文）
+# A区：剥离tool消息和tool_calls，只保留有文本的user/assistant（节省上下文）
 cleaned_a = []
 for msg in a_msgs:
     if msg.get('role') == 'tool':
