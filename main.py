@@ -958,14 +958,15 @@ async def build_partitioned_messages(
         result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
     
     # A区：剥离tool消息和tool_calls，只保留有文本的user/assistant（节省上下文）
-    cleaned_a = []
-    for msg in a_msgs:
-        if msg.get('role') == 'tool':
-            continue
-        m = {k: v for k, v in msg.items() if k not in ('created_at', 'tool_calls')}
-        if m.get('role') == 'assistant' and not (m.get('content') or '').strip():
-            continue
-        cleaned_a.append(m)
+   cleaned_a = []
+for msg in a_msgs:
+    if msg.get('role') == 'tool':
+        continue
+    m = {k: v for k, v in msg.items() if k not in ('created_at',)}
+    # 保留 tool_calls，但不用做额外处理
+    if m.get('role') == 'assistant' and not (m.get('content') or '').strip() and not m.get('tool_calls'):
+        continue
+    cleaned_a.append(m)
     
     # A区：从末尾往前找第一条非tool消息打BP
     for j in range(len(cleaned_a) - 1, -1, -1):
