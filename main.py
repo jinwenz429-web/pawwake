@@ -1227,38 +1227,7 @@ async def process_memories_background(
     """
     global _nonpartition_round_counter
     
-    try:
-        async def process_memories_background(
-    session_id: str,
-    user_msg: str,
-    assistant_msg: str,
-    model: str,
-    context_messages: list = None,
-    context_round_count: int = None,
-    skip_conversation_log: bool = False,
-    tool_messages: list = None,
-    assistant_tool_calls: list = None,
-    assistant_reasoning: str = None,
-):
-    """
-    后台异步：存储对话 + 提取记忆（不阻塞主流程）
-    
-    记忆提取受 MEMORY_EXTRACT_INTERVAL 控制：
-    - 0: 禁用自动提取
-    - 1: 每轮提取（默认）
-    - N: 每 N 轮提取一次
-    对话记录始终保存，不受间隔影响（除非 skip_conversation_log=True）。
-    
-    context_messages: 分区模式使用 DB 历史与本轮消息组成的权威上下文；
-                      非分区模式使用客户端发来的非 system 消息。
-    context_round_count: 分区模式当前 session 的逻辑轮数；非分区模式为 None。
-    skip_conversation_log: 跳过对话存储（标题生成等辅助请求时使用）
-    tool_messages: 客户端发来的工具结果消息列表
-    assistant_tool_calls: response中assistant的工具调用列表（如果有）
-    assistant_reasoning: response中assistant的reasoning_content（deepseek thinking mode）
-    """
-    global _nonpartition_round_counter
-    
+   
     try:
         # ===== 新增：过滤掉空内容的工具消息 =====
         if tool_messages:
