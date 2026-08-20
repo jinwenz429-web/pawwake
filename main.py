@@ -1622,12 +1622,30 @@ async def _chat_completions_inner(request: Request):
                 user_message,
                 conversation_recall_text,
             )
-            # ---------- 调试：查看 build_partitioned_messages 的输出 ----------
-            print(f"📦 build_partitioned_messages 返回的 messages 数量: {len(messages)}")
+           # ---------- 调试：补回 tool 消息前 ----------
+            print(f"📦 [补回前] messages 数量: {len(messages)}")
             for i, m in enumerate(messages):
-                content_preview = str(m.get('content', ''))[:50]
-                print(f"   [{i}] role={m.get('role')}, content_preview={content_preview}")
-            # ----------------------------------------------------------------
+                print(f"   [{i}] role={m.get('role')}")
+            # ------------------------------------------
+
+            # ---------- 手动补回 tool 消息 ----------
+            if tool_messages:
+                for tm in tool_messages:
+                    exists = any(
+                        m.get("role") == "tool" and m.get("tool_call_id") == tm.get("tool_call_id")
+                        for m in messages
+                    )
+                    if not exists:
+                        messages.append(tm)
+                        print(f"🔧 手动补回 tool 消息: {tm.get('tool_call_id')}")
+            # ----------------------------------------
+
+            # ---------- 调试：补回 tool 消息后 ----------
+            print(f"📦 [补回后] messages 数量: {len(messages)}")
+            for i, m in enumerate(messages):
+                print(f"   [{i}] role={m.get('role')}")
+            # --------------------------------------------
+
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
             return JSONResponse(
