@@ -1622,6 +1622,12 @@ async def _chat_completions_inner(request: Request):
                 user_message,
                 conversation_recall_text,
             )
+            # ---------- 调试：查看 build_partitioned_messages 的输出 ----------
+            print(f"📦 build_partitioned_messages 返回的 messages 数量: {len(messages)}")
+            for i, m in enumerate(messages):
+                content_preview = str(m.get('content', ''))[:50]
+                print(f"   [{i}] role={m.get('role')}, content_preview={content_preview}")
+            # ----------------------------------------------------------------
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
             return JSONResponse(
