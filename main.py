@@ -1457,7 +1457,20 @@ async def chat_completions(request: Request):
             status_code=500,
             content={"error": {"message": "Gateway internal error", "type": "gateway_error"}},
         )
-
+# ---------- 新增 GET 路由（处理 Kelivo 工具调用后的 GET 请求） ----------
+@app.get("/v1/chat/completions")
+async def get_chat_completions(request: Request):
+    """
+    处理 GET 请求（Kelivo 在工具调用后可能会发送此请求）
+    """
+    return JSONResponse(
+        status_code=405,
+        content={
+            "error": "Method Not Allowed",
+            "message": "Please use POST for /v1/chat/completions"
+        }
+    )
+# -----------------------------------------------------------------------
 
 async def _chat_completions_inner(request: Request):
     body = await request.json()
