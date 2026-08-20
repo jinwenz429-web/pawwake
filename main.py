@@ -1457,20 +1457,7 @@ async def chat_completions(request: Request):
             status_code=500,
             content={"error": {"message": "Gateway internal error", "type": "gateway_error"}},
         )
-# ---------- 新增 GET 路由（处理 Kelivo 工具调用后的 GET 请求） ----------
-@app.get("/v1/chat/completions")
-async def get_chat_completions(request: Request):
-    """
-    处理 GET 请求（Kelivo 在工具调用后可能会发送此请求）
-    """
-    return JSONResponse(
-        status_code=405,
-        content={
-            "error": "Method Not Allowed",
-            "message": "Please use POST for /v1/chat/completions"
-        }
-    )
-# -----------------------------------------------------------------------
+
 
 async def _chat_completions_inner(request: Request):
     body = await request.json()
@@ -1607,18 +1594,6 @@ async def _chat_completions_inner(request: Request):
                                     client_new_msgs.insert(0, m)
                                     print(f"⚠️ Race防护: 从客户端补充assistant(tool_calls)")
                                     break
-        # ---------- 强制补回当前请求中的 tool 消息（即使 DB 不等待） ----------
-        current_tool_msgs = [m for m in messages if m.get("role") == "tool"]
-        if current_tool_msgs:
-            existing_ids = set()
-            for m in db_msgs + client_new_msgs:
-                if m.get("role") == "tool" and m.get("tool_call_id"):
-                    existing_ids.add(m.get("tool_call_id"))
-            for tm in current_tool_msgs:
-                if tm.get("tool_call_id") not in existing_ids:
-                    client_new_msgs.append(tm)
-                    print(f"🔧 强制补回 tool 消息: {tm.get('tool_call_id')}")
-        # --------------------------------------------------------------------
         all_msgs = db_msgs + client_new_msgs
         extraction_context_messages = all_msgs
         extraction_round_count = len(group_by_rounds(all_msgs))
@@ -1647,30 +1622,6 @@ async def _chat_completions_inner(request: Request):
                 user_message,
                 conversation_recall_text,
             )
-           # ---------- 调试：补回 tool 消息前 ----------
-            print(f"📦 [补回前] messages 数量: {len(messages)}")
-            for i, m in enumerate(messages):
-                print(f"   [{i}] role={m.get('role')}")
-            # ------------------------------------------
-
-            # ---------- 手动补回 tool 消息 ----------
-            if tool_messages:
-                for tm in tool_messages:
-                    exists = any(
-                        m.get("role") == "tool" and m.get("tool_call_id") == tm.get("tool_call_id")
-                        for m in messages
-                    )
-                    if not exists:
-                        messages.append(tm)
-                        print(f"🔧 手动补回 tool 消息: {tm.get('tool_call_id')}")
-            # ----------------------------------------
-
-            # ---------- 调试：补回 tool 消息后 ----------
-            print(f"📦 [补回后] messages 数量: {len(messages)}")
-            for i, m in enumerate(messages):
-                print(f"   [{i}] role={m.get('role')}")
-            # --------------------------------------------
-
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
             return JSONResponse(
