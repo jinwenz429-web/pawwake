@@ -1594,6 +1594,18 @@ async def _chat_completions_inner(request: Request):
                                     client_new_msgs.insert(0, m)
                                     print(f"⚠️ Race防护: 从客户端补充assistant(tool_calls)")
                                     break
+        # ---------- 强制补回当前请求中的 tool 消息（即使 DB 不等待） ----------
+        current_tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        if current_tool_msgs:
+            existing_ids = set()
+            for m in db_msgs + client_new_msgs:
+                if m.get("role") == "tool" and m.get("tool_call_id"):
+                    existing_ids.add(m.get("tool_call_id"))
+            for tm in current_tool_msgs:
+                if tm.get("tool_call_id") not in existing_ids:
+                    client_new_msgs.append(tm)
+                    print(f"🔧 强制补回 tool 消息: {tm.get('tool_call_id')}")
+        # --------------------------------------------------------------------
         all_msgs = db_msgs + client_new_msgs
         extraction_context_messages = all_msgs
         extraction_round_count = len(group_by_rounds(all_msgs))
