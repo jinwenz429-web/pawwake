@@ -120,6 +120,33 @@ def get_active_session_id() -> str:
     return PARTITION_SESSION_ID
 
 
+def resolve_effective_session_id(
+    x_conversation_id,
+    body: dict,
+    partition_session_id,
+    generated_session_id,
+) -> tuple[str, str]:
+    """Resolve the request session without changing Dashboard active-session state."""
+    body = body if isinstance(body, dict) else {}
+    candidates = (
+        (x_conversation_id, "x_conversation_id"),
+        (body.get("session_id"), "body_session_id"),
+        (body.get("conversation_id"), "body_conversation_id"),
+        (partition_session_id, "partition_session_id"),
+        (generated_session_id, "generated"),
+    )
+    for value, source in candidates:
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value, source
+    return str(generated_session_id), "generated"
+
+
+def _partition_session_id_hash(session_id: str) -> str:
+    return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:12]
+
+
 def conversation_persistence_enabled() -> bool:
     """记忆、分区或对话召回任一开启时都需要保留历史。"""
     return MEMORY_ENABLED or CACHE_PARTITION_ENABLED or _db_module.CONVERSATION_RECALL_ENABLED
@@ -945,7 +972,10 @@ async def build_partitioned_messages(
     while _should_rotate(b_rounds_count, X, a_msgs) and rotation_count < max_rotations:
         rotation_count += 1
         trigger_info = f"B区{b_rounds_count}轮 >= X={X}" if CACHE_PARTITION_TRIGGER != "time" else f"A区首条消息超出{CACHE_PARTITION_WINDOW}分钟窗口"
-        print(f"🔄 轮转#{rotation_count}: session={session_id}, {trigger_info}")
+        print(
+            f"🔄 轮转#{rotation_count}: "
+            f"id_hash={_partition_session_id_hash(session_id)}, {trigger_info}"
+        )
         
         new_summary = await generate_summary(a_msgs, session_id)
         if new_summary:
@@ -1357,7 +1387,7 @@ async def process_memories_background(
             round_scope = "非分区累计"
         else:
             current_round_count = max(0, int(context_round_count))
-            round_scope = f"session={session_id}"
+            round_scope = f"id_hash={_partition_session_id_hash(session_id)}"
 
         if current_round_count <= 0:
             print("⏭️  当前上下文没有可提取的逻辑轮")
@@ -1533,14 +1563,19 @@ async def _chat_completions_inner(request: Request):
     if tool_messages:
         print(f"🔧 检测到 {len(tool_messages)} 条工具结果消息")
     
-    # ---------- 生成 session ID ----------
-    session_id = str(uuid.uuid4())[:8]
+    # ---------- 解析当前请求的 session ID ----------
+    generated_session_id = str(uuid.uuid4())[:8]
+    session_id, session_source = resolve_effective_session_id(
+        request.headers.get("X-Conversation-Id", ""),
+        body,
+        PARTITION_SESSION_ID,
+        generated_session_id,
+    )
     
     # ---------- 分区缓存模式 ----------
     if CACHE_PARTITION_ENABLED and not skip_conversation_log:
-        active_sid = get_active_session_id()
-        if active_sid:
-            session_id = active_sid
+        session_hash = _partition_session_id_hash(session_id)
+        print(f"partition_session source={session_source} id_hash={session_hash}")
         
         # 从DB读取历史
         try:
