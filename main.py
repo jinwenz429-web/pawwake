@@ -120,6 +120,33 @@ def get_active_session_id() -> str:
     return PARTITION_SESSION_ID
 
 
+def resolve_effective_session_id(
+    x_conversation_id,
+    body: dict,
+    partition_session_id,
+    generated_session_id,
+) -> tuple[str, str]:
+    """Resolve the request session without changing Dashboard active-session state."""
+    body = body if isinstance(body, dict) else {}
+    candidates = (
+        (x_conversation_id, "x_conversation_id"),
+        (body.get("session_id"), "body_session_id"),
+        (body.get("conversation_id"), "body_conversation_id"),
+        (partition_session_id, "partition_session_id"),
+        (generated_session_id, "generated"),
+    )
+    for value, source in candidates:
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value, source
+    return str(generated_session_id), "generated"
+
+
+def _partition_session_id_hash(session_id: str) -> str:
+    return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:12]
+
+
 def conversation_persistence_enabled() -> bool:
     """记忆、分区或对话召回任一开启时都需要保留历史。"""
     return MEMORY_ENABLED or CACHE_PARTITION_ENABLED or _db_module.CONVERSATION_RECALL_ENABLED
@@ -755,6 +782,23 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         return ""
 
 
+def _strip_replayed_reasoning(msg: dict) -> dict:
+    """Remove hidden reasoning fields before replaying history upstream."""
+    return {
+        k: v for k, v in msg.items()
+        if k not in ("reasoning_content", "reasoning")
+    }
+
+
+def _summary_failure_archive_marker(messages: list) -> str:
+    """Return a bounded marker when summary generation fails."""
+    return (
+        f"[较早对话已归档：共{len(messages)}条消息。"
+        "自动摘要本轮失败，因此未把原文继续注入上下文；"
+        "完整记录仍保存在数据库中，重要事实可由长期记忆与后续对话召回。]"
+    )
+
+
 def group_by_rounds(history: list) -> list:
     """
     按逻辑轮分组：每个user消息开始一轮，到下一个user前结束。
@@ -928,17 +972,23 @@ async def build_partitioned_messages(
     while _should_rotate(b_rounds_count, X, a_msgs) and rotation_count < max_rotations:
         rotation_count += 1
         trigger_info = f"B区{b_rounds_count}轮 >= X={X}" if CACHE_PARTITION_TRIGGER != "time" else f"A区首条消息超出{CACHE_PARTITION_WINDOW}分钟窗口"
-        print(f"🔄 轮转#{rotation_count}: session={session_id}, {trigger_info}")
+        print(
+            f"🔄 轮转#{rotation_count}: "
+            f"id_hash={_partition_session_id_hash(session_id)}, {trigger_info}"
+        )
         
         new_summary = await generate_summary(a_msgs, session_id)
         if new_summary:
             summary_parts.append(new_summary)
         elif CACHE_SUMMARY_MODEL:
-            # 配置了摘要模型但生成失败（网络/空content等）：中止本次轮转不推进滑窗，
-            # A区消息保留在上下文里，下次请求重试。只有纯轮转模式（模型留空）才无摘要直接滑出。
-            rotation_count -= 1
-            print(f"⚠️ 摘要生成失败，本次轮转中止，下次请求重试（A区消息未丢失）")
-            break
+            # 摘要失败不能让 A/B 分区无限增长。原始历史仍完整保存在数据库中，
+            # 这里只追加有界占位摘要并继续推进滑窗，避免原文反复进入上游 prompt。
+            fallback_summary = _summary_failure_archive_marker(a_msgs)
+            summary_parts.append(fallback_summary)
+            print(
+                "🗘 摘要生成失败：使用有界归档占位摘要继续轮转；"
+                "A区原文仍保存在数据库中"
+            )
 
         a_start_round += X
         a_end_round = a_start_round + X
@@ -977,7 +1027,10 @@ async def build_partitioned_messages(
     for msg in a_msgs:
         if msg.get('role') == 'tool':
             continue
-        m = {k: v for k, v in msg.items() if k not in ('created_at', 'tool_calls')}
+        m = _strip_replayed_reasoning({
+            k: v for k, v in msg.items()
+            if k not in ('created_at', 'tool_calls')
+        })
         if m.get('role') == 'assistant' and not (m.get('content') or '').strip():
             continue
         cleaned_a.append(m)
@@ -991,7 +1044,13 @@ async def build_partitioned_messages(
         result.append(m)
     
     # B区：先构建去掉created_at的副本，再从末尾往前打BP
-    b_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in b_msgs]
+    b_cleaned = [
+        _strip_replayed_reasoning({
+            k: v for k, v in msg.items()
+            if k not in ('created_at',)
+        })
+        for msg in b_msgs
+    ]
     
     for j in range(len(b_cleaned) - 1, -1, -1):
         if b_cleaned[j].get('role') != 'tool' and _apply_breakpoint(b_cleaned[j]):
@@ -1050,7 +1109,13 @@ async def _build_basic_cached(
         result.append({"role": "user", "content": blocks})
         result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
     
-    h_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in history]
+    h_cleaned = [
+        _strip_replayed_reasoning({
+            k: v for k, v in msg.items()
+            if k not in ('created_at',)
+        })
+        for msg in history
+    ]
     
     # 从末尾往前找第一条非tool消息打BP
     for j in range(len(h_cleaned) - 1, -1, -1):
@@ -1322,7 +1387,7 @@ async def process_memories_background(
             round_scope = "非分区累计"
         else:
             current_round_count = max(0, int(context_round_count))
-            round_scope = f"session={session_id}"
+            round_scope = f"id_hash={_partition_session_id_hash(session_id)}"
 
         if current_round_count <= 0:
             print("⏭️  当前上下文没有可提取的逻辑轮")
@@ -1498,14 +1563,19 @@ async def _chat_completions_inner(request: Request):
     if tool_messages:
         print(f"🔧 检测到 {len(tool_messages)} 条工具结果消息")
     
-    # ---------- 生成 session ID ----------
-    session_id = str(uuid.uuid4())[:8]
+    # ---------- 解析当前请求的 session ID ----------
+    generated_session_id = str(uuid.uuid4())[:8]
+    session_id, session_source = resolve_effective_session_id(
+        request.headers.get("X-Conversation-Id", ""),
+        body,
+        PARTITION_SESSION_ID,
+        generated_session_id,
+    )
     
     # ---------- 分区缓存模式 ----------
     if CACHE_PARTITION_ENABLED and not skip_conversation_log:
-        active_sid = get_active_session_id()
-        if active_sid:
-            session_id = active_sid
+        session_hash = _partition_session_id_hash(session_id)
+        print(f"partition_session source={session_source} id_hash={session_hash}")
         
         # 从DB读取历史
         try:
