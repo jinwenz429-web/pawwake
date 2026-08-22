@@ -511,6 +511,23 @@ async def write_dylan_diary(request: Request):
     return JSONResponse(status_code=201, content={"ok": True, "id": diary_id})
 
 
+def _format_memory_line(mem: dict) -> str:
+    date_value = ""
+    if mem.get("event_date"):
+        # 事件日期本身是本地日期，不做时区换算。
+        date_value = str(mem["event_date"])[:10]
+    elif mem.get("created_at"):
+        try:
+            utc_str = str(mem["created_at"])[:19]
+            utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            local_dt = utc_dt + timedelta(hours=TIMEZONE_HOURS)
+            date_value = local_dt.strftime("%Y-%m-%d")
+        except Exception:
+            date_value = str(mem["created_at"])[:10]
+    date_prefix = f"发生日期：{date_value}；" if date_value else ""
+    return f"- {date_prefix}{mem['content']}"
+
+
 async def build_system_prompt_with_memories(user_message: str, base_prompt: str) -> str:
     """
     构建带记忆的 system prompt
@@ -529,23 +546,7 @@ async def build_system_prompt_with_memories(user_message: str, base_prompt: str)
         if not memories:
             return base_prompt
         
-        # 格式化记忆文本（带日期，帮助模型判断新旧）
-        # event_date 优先：整理产物的 created_at 是整理当天，真实发生日存在 event_date 里。
-        # event_date 本身就是本地日期，不做时区换算
-        memory_lines = []
-        for mem in memories:
-            date_str = ""
-            if mem.get("event_date"):
-                date_str = f"[{str(mem['event_date'])[:10]}] "
-            elif mem.get("created_at"):
-                try:
-                    utc_str = str(mem['created_at'])[:19]
-                    utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    local_dt = utc_dt + timedelta(hours=TIMEZONE_HOURS)
-                    date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
-                except:
-                    date_str = f"[{str(mem['created_at'])[:10]}] "
-            memory_lines.append(f"- {date_str}{mem['content']}")
+        memory_lines = [_format_memory_line(mem) for mem in memories]
         memory_text = "\n".join(memory_lines)
         
         enhanced_prompt = f"""{base_prompt}
@@ -702,11 +703,12 @@ MEMORY_USAGE_GUIDE = """
 
 # 记忆应用
 用户消息中的 <retrieved_memories> 块是网关自动检索的过往记忆，使用时：
-- 像朋友般自然运用，不刻意展示；仅在相关话题出现时引用，避免主动提及
+- 自然吸收、运用这些记忆，不刻意展示；仅在相关话题出现时运用，避免主动提及
 - 对重要信息（如健康、日期、约定）保持一致性
 - 新信息与记忆冲突时，以新信息为准
 - 模糊记忆可表达不确定性："记得你似乎说过..."
-- 自然引用："记得你说过..."，避免机械式表达如"根据检索到的信息..."
+- 不得输出 citation、source、reference、来源标签、引用标签或 [cite:...] 等来源标记
+- 记忆中的发生日期仅用于内部判断时间先后，不是来源标记；不应在回答中复现，也不得转换为引用或来源标签
 """
 
 
@@ -1179,21 +1181,7 @@ async def build_memory_text(user_message: str) -> str:
         if not memories:
             return ""
         
-        memory_lines = []
-        for mem in memories:
-            date_str = ""
-            if mem.get("event_date"):
-                # 事件日期优先，本身是本地日期不做时区换算
-                date_str = f"[{str(mem['event_date'])[:10]}] "
-            elif mem.get("created_at"):
-                try:
-                    utc_str = str(mem['created_at'])[:19]
-                    utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                    local_dt = utc_dt + timedelta(hours=TIMEZONE_HOURS)
-                    date_str = f"[{local_dt.strftime('%Y-%m-%d')}] "
-                except:
-                    date_str = f"[{str(mem['created_at'])[:10]}] "
-            memory_lines.append(f"- {date_str}{mem['content']}")
+        memory_lines = [_format_memory_line(mem) for mem in memories]
         
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return (
