@@ -755,6 +755,23 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         return ""
 
 
+def _strip_replayed_reasoning(msg: dict) -> dict:
+    """Remove hidden reasoning fields before replaying history upstream."""
+    return {
+        k: v for k, v in msg.items()
+        if k not in ("reasoning_content", "reasoning")
+    }
+
+
+def _summary_failure_archive_marker(messages: list) -> str:
+    """Return a bounded marker when summary generation fails."""
+    return (
+        f"[较早对话已归档：共{len(messages)}条消息。"
+        "自动摘要本轮失败，因此未把原文继续注入上下文；"
+        "完整记录仍保存在数据库中，重要事实可由长期记忆与后续对话召回。]"
+    )
+
+
 def group_by_rounds(history: list) -> list:
     """
     按逻辑轮分组：每个user消息开始一轮，到下一个user前结束。
@@ -934,11 +951,14 @@ async def build_partitioned_messages(
         if new_summary:
             summary_parts.append(new_summary)
         elif CACHE_SUMMARY_MODEL:
-            # 配置了摘要模型但生成失败（网络/空content等）：中止本次轮转不推进滑窗，
-            # A区消息保留在上下文里，下次请求重试。只有纯轮转模式（模型留空）才无摘要直接滑出。
-            rotation_count -= 1
-            print(f"⚠️ 摘要生成失败，本次轮转中止，下次请求重试（A区消息未丢失）")
-            break
+            # 摘要失败不能让 A/B 分区无限增长。原始历史仍完整保存在数据库中，
+            # 这里只追加有界占位摘要并继续推进滑窗，避免原文反复进入上游 prompt。
+            fallback_summary = _summary_failure_archive_marker(a_msgs)
+            summary_parts.append(fallback_summary)
+            print(
+                "🗘 摘要生成失败：使用有界归档占位摘要继续轮转；"
+                "A区原文仍保存在数据库中"
+            )
 
         a_start_round += X
         a_end_round = a_start_round + X
@@ -977,7 +997,10 @@ async def build_partitioned_messages(
     for msg in a_msgs:
         if msg.get('role') == 'tool':
             continue
-        m = {k: v for k, v in msg.items() if k not in ('created_at', 'tool_calls')}
+        m = _strip_replayed_reasoning({
+            k: v for k, v in msg.items()
+            if k not in ('created_at', 'tool_calls')
+        })
         if m.get('role') == 'assistant' and not (m.get('content') or '').strip():
             continue
         cleaned_a.append(m)
@@ -991,7 +1014,13 @@ async def build_partitioned_messages(
         result.append(m)
     
     # B区：先构建去掉created_at的副本，再从末尾往前打BP
-    b_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in b_msgs]
+    b_cleaned = [
+        _strip_replayed_reasoning({
+            k: v for k, v in msg.items()
+            if k not in ('created_at',)
+        })
+        for msg in b_msgs
+    ]
     
     for j in range(len(b_cleaned) - 1, -1, -1):
         if b_cleaned[j].get('role') != 'tool' and _apply_breakpoint(b_cleaned[j]):
@@ -1050,7 +1079,13 @@ async def _build_basic_cached(
         result.append({"role": "user", "content": blocks})
         result.append({"role": "assistant", "content": "好的，我已了解之前的对话内容。"})
     
-    h_cleaned = [{k: v for k, v in msg.items() if k not in ('created_at',)} for msg in history]
+    h_cleaned = [
+        _strip_replayed_reasoning({
+            k: v for k, v in msg.items()
+            if k not in ('created_at',)
+        })
+        for msg in history
+    ]
     
     # 从末尾往前找第一条非tool消息打BP
     for j in range(len(h_cleaned) - 1, -1, -1):
