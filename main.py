@@ -148,6 +148,29 @@ def _partition_session_id_hash(session_id: str) -> str:
     return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:12]
 
 
+def _reconcile_current_tool_results(expected_tool_calls: list, client_tools: list) -> tuple:
+    """Split stale results from a complete current assistant tool-call turn."""
+    expected_ids = [tc.get("id") for tc in expected_tool_calls if tc.get("id")]
+    expected_id_set = set(expected_ids)
+    current_tools = [
+        tool for tool in client_tools
+        if tool.get("tool_call_id") in expected_id_set
+    ]
+    stale_tools = [
+        tool for tool in client_tools
+        if tool.get("tool_call_id") not in expected_id_set
+    ]
+
+    result_counts = {}
+    for tool in current_tools:
+        tool_call_id = tool.get("tool_call_id")
+        result_counts[tool_call_id] = result_counts.get(tool_call_id, 0) + 1
+
+    missing_ids = [tool_call_id for tool_call_id in expected_ids if result_counts.get(tool_call_id, 0) == 0]
+    duplicate_ids = [tool_call_id for tool_call_id in expected_ids if result_counts.get(tool_call_id, 0) > 1]
+    return current_tools, stale_tools, missing_ids, duplicate_ids
+
+
 def conversation_persistence_enabled() -> bool:
     """记忆、分区或对话召回任一开启时都需要保留历史。"""
     return MEMORY_ENABLED or CACHE_PARTITION_ENABLED or _db_module.CONVERSATION_RECALL_ENABLED
@@ -1646,14 +1669,38 @@ async def _chat_completions_inner(request: Request):
                 client_new_msgs = [m for m in client_new_msgs if m.get("role") != "tool"]
             else:
                 # DB在等待tool → 只保留匹配当前轮次assistant(tool_calls)的tool
-                expected_tool_ids = {tc.get("id") for tc in db_last.get("tool_calls", []) if tc.get("id")}
-                new_tools = [m for m in client_tools if m.get("tool_call_id") in expected_tool_ids]
-                stale_tools = [m for m in client_tools if m.get("tool_call_id") not in expected_tool_ids]
+                expected_tool_calls = db_last.get("tool_calls", [])
+                new_tools, stale_tools, missing_tool_ids, duplicate_tool_ids = (
+                    _reconcile_current_tool_results(expected_tool_calls, client_tools)
+                )
                 
                 if stale_tools:
                     print(f"🔧 去重: 丢弃{len(stale_tools)}条非当前轮次tool (ids: {[m.get('tool_call_id','?') for m in stale_tools]})")
                 if new_tools:
                     print(f"🔧 保留{len(new_tools)}条当前轮次tool (ids: {[m.get('tool_call_id','?') for m in new_tools]})")
+
+                if missing_tool_ids or duplicate_tool_ids:
+                    expected_count = len([tc for tc in expected_tool_calls if tc.get("id")])
+                    received_count = len({
+                        m.get("tool_call_id") for m in new_tools if m.get("tool_call_id")
+                    })
+                    print(
+                        f"❌ 当前工具结果轮次不完整: expected={expected_count}, received={received_count}, "
+                        f"missing={missing_tool_ids}, duplicate={duplicate_tool_ids}"
+                    )
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "error": {
+                                "message": "Current tool-call turn is incomplete.",
+                                "type": "incomplete_tool_results",
+                                "expected_count": expected_count,
+                                "received_count": received_count,
+                                "missing_tool_call_ids": missing_tool_ids,
+                                "duplicate_tool_call_ids": duplicate_tool_ids,
+                            }
+                        },
+                    )
                 
                 # 重建 client_new_msgs（user此时已只剩末尾连续块，全部保回，别把拆条发送的图丢了）
                 tail_users = [m for m in client_new_msgs if m.get("role") == "user"]
