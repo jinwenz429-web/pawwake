@@ -43,6 +43,7 @@ from database import init_tables, close_pool, save_message, search_memories, sav
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
+from diary_store import ensure_dylan_diary_table, save_dylan_diary
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,7 @@ async def lifespan(app: FastAPI):
     global PARTITION_SESSION_ID
     try:
         await init_tables()
+        await ensure_dylan_diary_table()
         await ensure_token_usage_table()
 
         # 从数据库恢复面板配置。这一步不能受 MEMORY_ENABLED 控制，
@@ -484,6 +486,30 @@ async def gateway_auth_middleware(request: Request, call_next):
 # ============================================================
 # 记忆注入
 # ============================================================
+
+@app.post("/internal/dylan-diary")
+async def write_dylan_diary(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body."})
+
+    content = str((body or {}).get("content") or "").strip()
+    metadata = (body or {}).get("metadata")
+
+    if not content:
+        return JSONResponse(status_code=400, content={"error": "content is required."})
+    if metadata is not None and not isinstance(metadata, dict):
+        return JSONResponse(status_code=400, content={"error": "metadata must be an object."})
+
+    try:
+        diary_id = await save_dylan_diary(content, metadata or {})
+    except Exception:
+        logger.exception("Failed to persist Dylan diary")
+        return JSONResponse(status_code=500, content={"error": "Failed to persist diary."})
+
+    return JSONResponse(status_code=201, content={"ok": True, "id": diary_id})
+
 
 async def build_system_prompt_with_memories(user_message: str, base_prompt: str) -> str:
     """
