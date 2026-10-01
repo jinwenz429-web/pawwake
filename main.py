@@ -23,6 +23,7 @@ import hmac
 import logging
 import secrets
 import time
+from functools import lru_cache
 import httpx
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -39,7 +40,7 @@ from database import (
     repair_broken_merge_references,
     search_memories_with_mode,
 )
-from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, replace_last_conversation_round, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, replace_last_conversation_round, archive_replaced_answer_memories, delete_assistant_rounds, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
@@ -950,10 +951,88 @@ def is_partition_reroll(db_messages: list, client_messages: list) -> bool:
     return client_prior != db_full[-len(client_prior):]
 
 
+def find_deleted_assistant_rounds(db_messages: list, client_messages: list) -> list:
+    """Find assistant replies absent from every possible client/DB alignment.
+
+    The client can truncate old context, so its visible history is matched to a
+    DB suffix. Only assistant messages may be skipped within that suffix;
+    ambiguous matches do not authorize deletion.
+    """
+    client = [m for m in client_messages if m.get("role") != "system"]
+    if not client or client[-1].get("role") != "user":
+        return []
+
+    db_visible = []
+    last_user_id = None
+    for message in db_messages:
+        role = message.get("role")
+        if role == "user":
+            last_user_id = message.get("id")
+        if role not in ("user", "assistant") or message.get("tool_calls"):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        db_visible.append((role, content, message.get("id"), last_user_id))
+
+    client_visible = [
+        (m.get("role"), m.get("content"))
+        for m in client[:-1]
+        if m.get("role") in ("user", "assistant")
+        and not m.get("tool_calls")
+        and isinstance(m.get("content"), str)
+        and m.get("content")
+    ][-120:]
+    db_visible = db_visible[-240:]
+    if not client_visible or not db_visible:
+        return []
+
+    @lru_cache(maxsize=None)
+    def align(db_index, client_index):
+        if db_index == len(db_visible):
+            return frozenset() if client_index == len(client_visible) else None
+        role, content, message_id, _ = db_visible[db_index]
+        possibilities = []
+        if client_index < len(client_visible) and (role, content) == client_visible[client_index]:
+            matched = align(db_index + 1, client_index + 1)
+            if matched is not None:
+                possibilities.append(matched)
+        if role == "assistant" and isinstance(message_id, int):
+            skipped = align(db_index + 1, client_index)
+            if skipped is not None:
+                possibilities.append(skipped | {message_id})
+        if not possibilities:
+            return None
+        definite = set(possibilities[0])
+        for possibility in possibilities[1:]:
+            definite.intersection_update(possibility)
+        return frozenset(definite)
+
+    matches = []
+    for start, (role, content, _, _) in enumerate(db_visible):
+        if (role, content) != client_visible[0]:
+            continue
+        result = align(start, 0)
+        if result is not None:
+            matches.append(result)
+    if not matches:
+        return []
+    definite_ids = set(matches[0])
+    for match in matches[1:]:
+        definite_ids.intersection_update(match)
+    return [
+        (user_id, assistant_id)
+        for role, _, assistant_id, user_id in db_visible
+        if role == "assistant" and assistant_id in definite_ids
+        and isinstance(user_id, int)
+    ]
+
+
 def _build_memory_extraction_messages(
     context_messages: list,
     assistant_msg: str,
     interval: int,
+    current_assistant_id: int = None,
 ) -> tuple[list, int]:
     """按逻辑轮截取近期上下文，并附上本轮最终 assistant 回复。"""
     non_system = [
@@ -962,12 +1041,16 @@ def _build_memory_extraction_messages(
     ]
     recent_rounds = group_by_rounds(non_system)[-max(1, interval):]
     messages = [
-        {"role": msg.get("role"), "content": msg.get("content", "")}
+        {"role": msg.get("role"), "content": msg.get("content", ""),
+         "source_id": msg.get("source_id")}
         for round_messages in recent_rounds
         for msg in round_messages
         if msg.get("role") in {"user", "assistant"}
+        and isinstance(msg.get("content"), str)
+        and msg.get("content").strip()
     ]
-    messages.append({"role": "assistant", "content": assistant_msg})
+    messages.append({"role": "assistant", "content": assistant_msg,
+                     "source_id": current_assistant_id})
     return messages, len(recent_rounds)
 
 
@@ -1414,7 +1497,8 @@ async def process_memories_background(
     """
     global _nonpartition_round_counter
     
-   
+    stored_user_id = None
+    stored_assistant_id = None
     try:
         # ===== 新增：过滤掉空内容的工具消息 =====
         if tool_messages:
@@ -1455,7 +1539,7 @@ async def process_memories_background(
                 if assistant_reasoning:
                     ast_meta_dict["reasoning_content"] = assistant_reasoning
                 ast_meta = json.dumps(ast_meta_dict) if ast_meta_dict else None
-                await save_message(session_id, "assistant", assistant_msg or "", model, metadata=ast_meta)
+                stored_assistant_id = await save_message(session_id, "assistant", assistant_msg or "", model, metadata=ast_meta)
                 print(f"🔧 存储: {len(tool_messages)}条tool + 1条assistant" + (" (含tool_calls)" if assistant_tool_calls else "") + (" (含reasoning)" if assistant_reasoning else ""))
         else:
             # 普通对话或首次工具调用
@@ -1468,16 +1552,20 @@ async def process_memories_background(
             
             replaced = False
             if reroll:
-                replaced = await replace_last_conversation_round(
+                replacement = await replace_last_conversation_round(
                     session_id, user_msg, assistant_msg or "", model, assistant_meta,
                     expected_assistant_id=reroll_expected_assistant_id,
                 )
+                replaced = bool(replacement)
+                if isinstance(replacement, dict):
+                    stored_user_id = replacement.get("user_id")
+                    stored_assistant_id = replacement.get("assistant_id")
                 if replaced:
                     print("🔄 已替换上次回复及其工具消息")
             if not replaced:
                 # 相同文字也可能是用户有意重复，只有明确的重生成才替换。
-                await save_message(session_id, "user", user_msg, model)
-                await save_message(session_id, "assistant", assistant_msg or "", model, metadata=assistant_meta)
+                stored_user_id = await save_message(session_id, "user", user_msg, model)
+                stored_assistant_id = await save_message(session_id, "assistant", assistant_msg or "", model, metadata=assistant_meta)
                 if assistant_tool_calls:
                     print(f"🔧 存储: user + assistant (含{len(assistant_tool_calls)}个tool_calls)" + (" (含reasoning)" if assistant_reasoning else ""))
         
@@ -1530,11 +1618,18 @@ async def process_memories_background(
         
         # 4. 按逻辑轮截取近期上下文，而非发送完整会话。
         if context_messages:
+            extraction_context = [dict(message) for message in context_messages]
+            if stored_user_id:
+                for message in reversed(extraction_context):
+                    if message.get("role") == "user" and not message.get("source_id"):
+                        message["source_id"] = stored_user_id
+                        break
             messages_for_extraction, selected_round_count = (
                 _build_memory_extraction_messages(
-                    context_messages,
+                    extraction_context,
                     assistant_msg,
                     MEMORY_EXTRACT_INTERVAL,
+                    stored_assistant_id,
                 )
             )
             print(
@@ -1543,11 +1638,16 @@ async def process_memories_background(
             )
         else:
             messages_for_extraction = [
-                {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": assistant_msg},
+                {"role": "user", "content": user_msg, "source_id": stored_user_id},
+                {"role": "assistant", "content": assistant_msg, "source_id": stored_assistant_id},
             ]
         
         new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
+        allowed_source_ids = {
+            message.get("source_id") for message in messages_for_extraction
+            if isinstance(message.get("source_id"), int)
+            and not isinstance(message.get("source_id"), bool)
+        }
         
         # 过滤垃圾记忆（不靠模型自觉，硬过滤）
         META_BLACKLIST = [
@@ -1564,6 +1664,20 @@ async def process_memories_background(
             if any(kw in content for kw in META_BLACKLIST):
                 print(f"🚫 过滤掉meta记忆: {content[:60]}...")
                 continue
+            cited_ids = set()
+            for raw_id in (mem.get("source_ids") or []):
+                if isinstance(raw_id, bool):
+                    continue
+                try:
+                    source_id = int(raw_id)
+                except (TypeError, ValueError):
+                    continue
+                if source_id in allowed_source_ids:
+                    cited_ids.add(source_id)
+            if not cited_ids:
+                print("🚫 跳过无可核验消息来源的提取结果")
+                continue
+            mem["verified_source_ids"] = sorted(cited_ids)
             filtered_memories.append(mem)
         
         dedup_stats = {"inserted": 0, "updated": 0, "skipped": 0}
@@ -1572,6 +1686,7 @@ async def process_memories_background(
                 content=mem["content"],
                 importance=mem["importance"],
                 source_session=session_id,
+                source_message_ids=mem["verified_source_ids"],
             )
             action = result.get("action", "skipped")
             dedup_stats[action] = dedup_stats.get(action, 0) + 1
@@ -1732,11 +1847,36 @@ async def _chat_completions_inner(request: Request):
                 },
             )
 
+        db_detection_messages = [
+            dict(message, id=row.get("id"))
+            for message, row in zip(db_msgs, db_history or [])
+        ]
+        deleted_rounds = find_deleted_assistant_rounds(db_detection_messages, original_messages)
+        if deleted_rounds:
+            if not await delete_assistant_rounds(session_id, deleted_rounds):
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": {"message": "Conversation changed; retry this request.",
+                                       "type": "conversation_sync_conflict"}},
+                )
+            def is_deleted_row(row):
+                return any(user_id < row.get("id", -1) <= assistant_id
+                           for user_id, assistant_id in deleted_rounds)
+            kept = [(row, msg) for row, msg in zip(db_history, db_msgs)
+                    if not is_deleted_row(row)]
+            db_history = [row for row, _ in kept]
+            db_msgs = [msg for _, msg in kept]
+            print(f"🗑️ 已同步客户端删除的 {len(deleted_rounds)} 条助手回复")
+
         partition_reroll = is_partition_reroll(db_msgs, original_messages)
         if partition_reroll:
             reroll_expected_assistant_id = db_history[-1].get("id")
             last_user_index = max(i for i, m in enumerate(db_msgs) if m.get("role") == "user")
+            await archive_replaced_answer_memories(
+                session_id, db_history[last_user_index]["id"], reroll_expected_assistant_id,
+            )
             db_msgs = db_msgs[:last_user_index]
+            db_history = db_history[:last_user_index]
             print("🔄 分区模式: 客户端上下文表明正在重生成最后一条回复")
         
         # 提取客户端新消息（非system），可能是user、tool、或带tool_calls的assistant
@@ -1760,6 +1900,22 @@ async def _chat_completions_inner(request: Request):
                 if m.get("role") != "user" or id(m) in tail_user_ids
             ]
             print(f"🔧 去重: 过滤{len(user_msgs)-len(tail_user_ids)}条冗余user，保留末尾连续{len(tail_user_ids)}条")
+        if deleted_rounds:
+            # 删除最后一条回复后，客户端会留下连续的旧 user + 新 user。
+            # 旧 user 已在 DB，不能再拼进当前请求。
+            db_tail_users = []
+            for m in reversed(db_msgs):
+                if m.get("role") != "user":
+                    break
+                db_tail_users.insert(0, m)
+            client_tail_users = [m for m in client_new_msgs if m.get("role") == "user"]
+            stale_user_ids = set()
+            for old, incoming in zip(db_tail_users, client_tail_users[:-1]):
+                if old.get("content") != incoming.get("content"):
+                    break
+                stale_user_ids.add(id(incoming))
+            if stale_user_ids:
+                client_new_msgs = [m for m in client_new_msgs if id(m) not in stale_user_ids]
         # 工具结果轮次处理：基于DB状态 + 当前轮次tool_call_id精确判断
         client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
         if client_tools:
@@ -1831,7 +1987,10 @@ async def _chat_completions_inner(request: Request):
                                     print(f"⚠️ Race防护: 从客户端补充assistant(tool_calls)")
                                     break
         all_msgs = db_msgs + client_new_msgs
-        extraction_context_messages = all_msgs
+        extraction_context_messages = [
+            dict(message, source_id=row.get("id"))
+            for message, row in zip(db_msgs, db_history)
+        ] + [dict(message) for message in client_new_msgs]
         extraction_round_count = len(group_by_rounds(all_msgs))
         
         # 同步更新tool_messages，避免process_memories_background存重复的旧tool

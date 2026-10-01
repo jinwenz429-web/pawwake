@@ -90,6 +90,7 @@ EXTRACTION_PROMPT = """你是长期记忆筛选器。你的任务不是记录聊
 - AI 的纯知识性回答、翻译、百科、代码讲解
 - 关于记忆系统本身“有没有记住某句话”的元讨论
 - AI 的思考过程、思维链内容
+- AI 的安全审查、拒答模板和免责声明；除非用户明确表达了值得长期保留的偏好或边界
 - 已经能被更稳定、更完整的一条长期记忆覆盖的细碎改写
 
 # 凝练原则
@@ -110,10 +111,11 @@ EXTRACTION_PROMPT = """你是长期记忆筛选器。你的任务不是记录聊
 - 如果没有达到长期记忆门槛的新信息，返回空数组 []
 
 # 输出格式
-只返回 JSON 数组：
+每条记忆必须给出支撑它的最少消息编号 source_ids。只引用真正提供该事实的消息；
+如果没有带编号的消息能支撑，就不要输出那条记忆。只返回 JSON 数组：
 [
-  {{"content": "高度凝练、可独立理解的长期记忆", "importance": 分数}},
-  {{"content": "完整的重要事件或长期事实", "importance": 分数}}
+  {{"content": "高度凝练、可独立理解的长期记忆", "importance": 分数, "source_ids": [消息编号]}},
+  {{"content": "完整的重要事件或长期事实", "importance": 分数, "source_ids": [消息编号]}}
 ]
 
 importance 1-10：长期影响越大、未来越常用，分数越高。普通日常即使真实发生也不应靠低分进入记忆库，而应直接不提取。
@@ -143,10 +145,12 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
     for msg in messages:
         role = msg.get("role", "unknown")
         content = msg.get("content", "")
+        source_id = msg.get("source_id")
+        source_label = f"[消息 {source_id}] " if isinstance(source_id, int) else "[无来源编号] "
         if role == "user":
-            conversation_text += f"用户: {content}\n"
+            conversation_text += f"{source_label}用户: {content}\n"
         elif role == "assistant":
-            conversation_text += f"AI: {content}\n"
+            conversation_text += f"{source_label}AI: {content}\n"
 
     if not conversation_text.strip():
         return []
@@ -258,9 +262,11 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             valid_memories = []
             for mem in memories:
                 if isinstance(mem, dict) and "content" in mem:
+                    source_ids = mem.get("source_ids")
                     valid_memories.append({
                         "content": str(mem["content"]),
                         "importance": int(mem.get("importance", 5)),
+                        "source_ids": source_ids if isinstance(source_ids, list) else [],
                     })
 
             print(f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）")

@@ -128,6 +128,18 @@ async def init_tables():
                 last_accessed   TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_message_sources (
+                memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (memory_id, message_id)
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_message_sources_message
+            ON memory_message_sources (message_id)
+        """)
         
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_fts 
@@ -696,7 +708,7 @@ async def replace_last_conversation_round(
     session_id: str, expected_user_content: str, assistant_content: str,
     model: str = "", metadata: str = None,
     expected_assistant_id: int = None,
-) -> bool:
+) -> dict | None:
     """Atomically replace the response (including tools) after the last user row."""
     tsv_text = (
         jieba_tokenize_for_tsv(assistant_content or "")
@@ -721,21 +733,114 @@ async def replace_last_conversation_round(
                 or latest["role"] != "assistant" or latest["id"] <= user["id"]
                 or latest["id"] != expected_assistant_id
             ):
-                return False
+                return None
+            await conn.execute(
+                """UPDATE memories SET is_active = FALSE
+                   WHERE id IN (
+                       SELECT DISTINCT source.memory_id
+                       FROM memory_message_sources AS source
+                       JOIN conversations AS message ON message.id = source.message_id
+                       WHERE message.session_id = $1 AND message.role = 'assistant'
+                         AND message.id > $2 AND message.id <= $3
+                   )""",
+                session_id, user["id"], expected_assistant_id,
+            )
             await conn.execute(
                 """DELETE FROM conversations
                    WHERE session_id = $1 AND id > $2 AND id <= $3""",
                 session_id, user["id"], expected_assistant_id,
             )
-            await conn.execute(
+            replacement = await conn.fetchrow(
                 """INSERT INTO conversations
                    (session_id, role, content, model, metadata, content_tsv)
                    VALUES ($1, 'assistant', $2, $3, $4,
-                           array_to_tsvector(string_to_array($5, ' ')))""",
+                           array_to_tsvector(string_to_array($5, ' ')))
+                   RETURNING id""",
                 session_id, assistant_content, model, metadata, tsv_text,
+            )
+            await conn.execute(
+                "DELETE FROM session_cache_state WHERE session_id = $1", session_id,
             )
     if CONVERSATION_RECALL_ENABLED and EMBEDDING_API_KEY and assistant_content.strip():
         kick_embedding_backfill()
+    return {"user_id": user["id"], "assistant_id": replacement["id"]}
+
+
+async def archive_replaced_answer_memories(
+    session_id: str, user_id: int, assistant_id: int,
+) -> None:
+    """Hide memories cited from an answer before generating its replacement."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            await conn.execute(
+                """UPDATE memories SET is_active = FALSE
+                   WHERE id IN (
+                       SELECT DISTINCT source.memory_id
+                       FROM memory_message_sources AS source
+                       JOIN conversations AS message ON message.id = source.message_id
+                       WHERE message.session_id = $1 AND message.role = 'assistant'
+                         AND message.id > $2 AND message.id <= $3
+                   )""",
+                session_id, user_id, assistant_id,
+            )
+            await conn.execute(
+                "DELETE FROM session_cache_state WHERE session_id = $1", session_id,
+            )
+
+
+async def delete_assistant_rounds(session_id: str, round_ids: list) -> bool:
+    """Remove confirmed deleted replies and their tool rows, keeping user turns."""
+    if not round_ids:
+        return True
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            for user_id, assistant_id in round_ids:
+                if not isinstance(user_id, int) or not isinstance(assistant_id, int) or user_id >= assistant_id:
+                    return False
+                user = await conn.fetchrow(
+                    "SELECT role FROM conversations WHERE session_id = $1 AND id = $2",
+                    session_id, user_id,
+                )
+                assistant = await conn.fetchrow(
+                    "SELECT role FROM conversations WHERE session_id = $1 AND id = $2",
+                    session_id, assistant_id,
+                )
+                intervening_user = await conn.fetchval(
+                    """SELECT 1 FROM conversations
+                       WHERE session_id = $1 AND role = 'user'
+                         AND id > $2 AND id < $3 LIMIT 1""",
+                    session_id, user_id, assistant_id,
+                )
+                if (
+                    not user or user["role"] != "user"
+                    or not assistant or assistant["role"] != "assistant"
+                    or intervening_user
+                ):
+                    return False
+            for user_id, assistant_id in round_ids:
+                await conn.execute(
+                    """UPDATE memories SET is_active = FALSE
+                       WHERE id IN (
+                           SELECT DISTINCT source.memory_id
+                           FROM memory_message_sources AS source
+                           JOIN conversations AS message ON message.id = source.message_id
+                           WHERE message.session_id = $1 AND message.role = 'assistant'
+                             AND message.id > $2 AND message.id <= $3
+                       )""",
+                    session_id, user_id, assistant_id,
+                )
+                await conn.execute(
+                    """DELETE FROM conversations WHERE session_id = $1
+                       AND id > $2 AND id <= $3 AND role <> 'user'""",
+                    session_id, user_id, assistant_id,
+                )
+            await conn.execute(
+                "DELETE FROM session_cache_state WHERE session_id = $1", session_id,
+            )
     return True
 
 
@@ -1370,7 +1475,8 @@ def _is_materially_richer_memory(new_content: str, old_content: str) -> bool:
 
 async def save_memory_deduplicated(content: str, importance: int = 5,
                                    source_session: str = "",
-                                   threshold: float = DEFAULT_MEMORY_DEDUP_THRESHOLD) -> dict:
+                                   threshold: float = DEFAULT_MEMORY_DEDUP_THRESHOLD,
+                                   source_message_ids: list = None) -> dict:
     """自动提取专用的原子判重写入。"""
     clean_content = str(content or "").strip()
     if not clean_content:
@@ -1486,6 +1592,16 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                     "matched_id": None,
                     "similarity": None,
                 }
+
+            source_ids = sorted({value for value in (source_message_ids or [])
+                                 if isinstance(value, int) and not isinstance(value, bool)
+                                 and value > 0})
+            if result["action"] in ("inserted", "updated") and result["memory_id"] and source_ids:
+                await conn.execute(
+                    """INSERT INTO memory_message_sources (memory_id, message_id)
+                       SELECT $1, unnest($2::int[]) ON CONFLICT DO NOTHING""",
+                    result["memory_id"], source_ids,
+                )
 
     if MEMORY_VECTOR_ENABLED and embedding_refresh_id:
         try:
