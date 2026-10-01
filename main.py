@@ -39,7 +39,7 @@ from database import (
     repair_broken_merge_references,
     search_memories_with_mode,
 )
-from database import init_tables, close_pool, save_message, search_memories, save_memory, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
@@ -286,6 +286,28 @@ async def lifespan(app: FastAPI):
     global PARTITION_SESSION_ID
     try:
         await init_tables()
+
+        # 一次性维护开关：dry-run 只统计；apply 仅软归档重复 layer-1 碎片。
+        dedupe_mode = os.getenv("MEMORY_DEDUPE_ON_START", "").strip().lower()
+        if dedupe_mode in {"dry-run", "apply"}:
+            try:
+                dedupe_threshold = float(os.getenv("MEMORY_DEDUPE_THRESHOLD", "0.88"))
+            except ValueError:
+                dedupe_threshold = 0.88
+            dedupe_threshold = min(1.0, max(0.5, dedupe_threshold))
+            dedupe_result = await dedupe_active_fragment_memories(
+                threshold=dedupe_threshold,
+                apply=(dedupe_mode == "apply"),
+            )
+            print(
+                "🧹 记忆去重维护："
+                f"mode={dedupe_result['mode']}, "
+                f"scanned={dedupe_result['active_fragments_scanned']}, "
+                f"groups={dedupe_result['duplicate_groups']}, "
+                f"duplicates={dedupe_result['duplicates_found']}, "
+                f"threshold={dedupe_result['threshold']}"
+            )
+
         await ensure_dylan_diary_table()
         await ensure_token_usage_table()
 
@@ -1485,16 +1507,31 @@ async def process_memories_background(
                 continue
             filtered_memories.append(mem)
         
+        dedup_stats = {"inserted": 0, "updated": 0, "skipped": 0}
         for mem in filtered_memories:
-            await save_memory(
+            result = await save_memory_deduplicated(
                 content=mem["content"],
                 importance=mem["importance"],
                 source_session=session_id,
             )
+            action = result.get("action", "skipped")
+            dedup_stats[action] = dedup_stats.get(action, 0) + 1
+            if action == "skipped" and result.get("reason"):
+                print(
+                    f"🧹 跳过重复记忆: reason={result['reason']}, "
+                    f"matched_id={result.get('matched_id')}"
+                )
         
         if filtered_memories:
             total = await get_all_memories_count()
-            print(f"💾 已保存 {len(filtered_memories)} 条新记忆（过滤了 {len(new_memories) - len(filtered_memories)} 条），总计 {total} 条")
+            print(
+                "💾 记忆处理完成："
+                f"新增 {dedup_stats['inserted']}，"
+                f"升级 {dedup_stats['updated']}，"
+                f"去重跳过 {dedup_stats['skipped']}，"
+                f"meta过滤 {len(new_memories) - len(filtered_memories)}，"
+                f"总计 {total} 条"
+            )
             
     except Exception as e:
         print(f"⚠️  后台记忆处理失败: {e}")

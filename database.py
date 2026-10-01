@@ -1263,6 +1263,263 @@ async def save_memory(content: str, importance: int = 5, source_session: str = "
         return row["id"] if row else None
 
 
+_MEMORY_DEDUP_LOCK_KEY = 184673291
+DEFAULT_MEMORY_DEDUP_THRESHOLD = 0.88
+
+
+def _normalize_memory_text(text: str) -> str:
+    """用于判重的轻量规范化：忽略大小写、空白和标点，但保留文字/数字本身。"""
+    return re.sub(r"[\W_]+", "", str(text or "").strip().lower(), flags=re.UNICODE)
+
+
+def _memory_duplicate_relation(new_content: str, old_content: str,
+                               threshold: float = DEFAULT_MEMORY_DEDUP_THRESHOLD) -> tuple[str | None, float]:
+    """判定两条记忆的重复关系。阈值故意偏高，宁可漏掉弱相似，也不误伤不同事实。"""
+    new_norm = _normalize_memory_text(new_content)
+    old_norm = _normalize_memory_text(old_content)
+    if not new_norm or not old_norm:
+        return None, 0.0
+
+    if new_norm == old_norm:
+        return "exact", 1.0
+
+    # 太短的文本不做包含判定，避免“爱猫”之类短片段误吞别的事实。
+    if min(len(new_norm), len(old_norm)) >= 8:
+        if new_norm in old_norm:
+            return "containment", len(new_norm) / max(1, len(old_norm))
+
+        if old_norm in new_norm:
+            return "containment_update", len(old_norm) / max(1, len(new_norm))
+
+    # 否定状态不同的内容不能仅凭关键词重合判成重复。
+    negation_markers = ("不喜欢", "不想", "不要", "没有", "从不", "讨厌", "拒绝", "停止", "戒掉", "不")
+    new_has_negation = any(marker in str(new_content or "") for marker in negation_markers)
+    old_has_negation = any(marker in str(old_content or "") for marker in negation_markers)
+    if new_has_negation != old_has_negation:
+        return None, 0.0
+
+    new_keywords = set(extract_search_keywords(new_content))
+    old_keywords = set(extract_search_keywords(old_content))
+    if not new_keywords or not old_keywords:
+        return None, 0.0
+
+    similarity = len(new_keywords & old_keywords) / max(1, len(new_keywords | old_keywords))
+    if similarity >= threshold:
+        return "similarity", similarity
+
+    return None, similarity
+
+
+def _is_materially_richer_memory(new_content: str, old_content: str) -> bool:
+    """只有新内容明显更完整时才覆盖旧碎片，避免同义改写来回抖动。"""
+    new_len = len(_normalize_memory_text(new_content))
+    old_len = len(_normalize_memory_text(old_content))
+    if new_len <= old_len:
+        return False
+    return new_len >= old_len + max(8, int(old_len * 0.15))
+
+
+async def save_memory_deduplicated(content: str, importance: int = 5,
+                                   source_session: str = "",
+                                   threshold: float = DEFAULT_MEMORY_DEDUP_THRESHOLD) -> dict:
+    """自动提取专用的原子判重写入。"""
+    clean_content = str(content or "").strip()
+    if not clean_content:
+        return {
+            "action": "skipped",
+            "reason": "empty",
+            "memory_id": None,
+            "matched_id": None,
+            "similarity": None,
+        }
+
+    pool = await get_pool()
+    embedding_refresh_id = None
+    result = None
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                _MEMORY_DEDUP_LOCK_KEY,
+            )
+            rows = await conn.fetch("""
+                SELECT id, content, importance, layer
+                FROM memories
+                WHERE is_active = TRUE
+                ORDER BY layer DESC, id DESC
+            """)
+
+            matched = None
+            for row in rows:
+                reason, similarity = _memory_duplicate_relation(
+                    clean_content,
+                    row["content"] or "",
+                    threshold,
+                )
+                if reason:
+                    matched = (row, reason, similarity)
+                    break
+
+            if matched:
+                row, reason, similarity = matched
+                matched_id = int(row["id"])
+                layer = int(row["layer"] or 1)
+
+                if (
+                    layer == 1
+                    and reason == "containment_update"
+                    and _is_materially_richer_memory(clean_content, row["content"] or "")
+                ):
+                    embedding_column = "embedding" if HAS_PGVECTOR else "embedding_json"
+                    await conn.execute(
+                        f"""UPDATE memories
+                            SET content = $1,
+                                importance = GREATEST(COALESCE(importance, 5), $2),
+                                last_accessed = NOW(),
+                                {embedding_column} = NULL
+                            WHERE id = $3""",
+                        clean_content,
+                        int(importance),
+                        matched_id,
+                    )
+                    embedding_refresh_id = matched_id
+                    result = {
+                        "action": "updated",
+                        "reason": reason,
+                        "memory_id": matched_id,
+                        "matched_id": matched_id,
+                        "similarity": similarity,
+                    }
+                else:
+                    result = {
+                        "action": "skipped",
+                        "reason": reason,
+                        "memory_id": matched_id,
+                        "matched_id": matched_id,
+                        "similarity": similarity,
+                    }
+            else:
+                row = await conn.fetchrow(
+                    """INSERT INTO memories (content, importance, source_session)
+                       VALUES ($1, $2, $3)
+                       RETURNING id""",
+                    clean_content,
+                    int(importance),
+                    source_session,
+                )
+                memory_id = int(row["id"]) if row else None
+                embedding_refresh_id = memory_id
+                result = {
+                    "action": "inserted",
+                    "reason": None,
+                    "memory_id": memory_id,
+                    "matched_id": None,
+                    "similarity": None,
+                }
+
+    if MEMORY_VECTOR_ENABLED and embedding_refresh_id:
+        try:
+            embedding = await compute_embedding(clean_content)
+            if embedding:
+                async with pool.acquire() as conn:
+                    await save_memory_embedding(conn, embedding_refresh_id, embedding)
+        except Exception as e:
+            print(f"⚠️ 记忆 {embedding_refresh_id} embedding刷新失败: {e}")
+
+    return result
+
+
+async def dedupe_active_fragment_memories(
+    threshold: float = DEFAULT_MEMORY_DEDUP_THRESHOLD,
+    apply: bool = False,
+) -> dict:
+    """扫描活跃 layer-1 碎片的高度重复项；apply=True 只软归档重复项。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                _MEMORY_DEDUP_LOCK_KEY,
+            )
+            rows = await conn.fetch("""
+                SELECT id, content, importance
+                FROM memories
+                WHERE is_active = TRUE AND COALESCE(layer, 1) = 1
+                ORDER BY id
+            """)
+
+            groups = []
+            for row in rows:
+                row_dict = dict(row)
+                target_group = None
+                for group in groups:
+                    for member in group:
+                        reason, _ = _memory_duplicate_relation(
+                            row_dict["content"] or "",
+                            member["content"] or "",
+                            threshold,
+                        )
+                        if reason:
+                            target_group = group
+                            break
+                    if target_group is not None:
+                        break
+
+                if target_group is None:
+                    groups.append([row_dict])
+                else:
+                    target_group.append(row_dict)
+
+            duplicate_groups = [group for group in groups if len(group) > 1]
+            plan = []
+            deactivate_ids = []
+
+            for group in duplicate_groups:
+                canonical = max(
+                    group,
+                    key=lambda item: (
+                        len(_normalize_memory_text(item["content"] or "")),
+                        int(item["importance"] or 5),
+                        -int(item["id"]),
+                    ),
+                )
+                duplicate_ids = sorted(
+                    int(item["id"])
+                    for item in group
+                    if int(item["id"]) != int(canonical["id"])
+                )
+                max_importance = max(int(item["importance"] or 5) for item in group)
+                deactivate_ids.extend(duplicate_ids)
+                plan.append({
+                    "canonical_id": int(canonical["id"]),
+                    "duplicate_ids": duplicate_ids,
+                    "max_importance": max_importance,
+                })
+
+            if apply and deactivate_ids:
+                await conn.execute(
+                    "UPDATE memories SET is_active = FALSE WHERE id = ANY($1::int[])",
+                    deactivate_ids,
+                )
+                for item in plan:
+                    await conn.execute(
+                        "UPDATE memories SET importance = GREATEST(COALESCE(importance, 5), $1) WHERE id = $2",
+                        item["max_importance"],
+                        item["canonical_id"],
+                    )
+
+            return {
+                "mode": "apply" if apply else "dry-run",
+                "threshold": float(threshold),
+                "active_fragments_scanned": len(rows),
+                "duplicate_groups": len(plan),
+                "duplicates_found": len(deactivate_ids),
+                "canonical_ids": [item["canonical_id"] for item in plan],
+                "duplicate_ids": deactivate_ids,
+            }
+
+
 async def search_memories(query: str, limit: int = 10):
     """
     搜索相关记忆
