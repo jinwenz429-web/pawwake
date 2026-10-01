@@ -98,6 +98,7 @@
                         </select>
                         <div class="toolbar-actions">
                             <button class="btn btn-warning" id="consolidateBtn" onclick="openConsolidateModal()">整理记忆</button>
+                            <button class="btn btn-primary" id="rebuildBtn" onclick="openRebuildModal()">整库重整</button>
                             <label class="checkbox-label">
                                 <input type="checkbox" id="selectAll" onchange="toggleAll()">
                                 <span>全选</span>
@@ -206,6 +207,22 @@
                     <div class="modal-actions">
                         <button class="btn btn-secondary" onclick="closeConsolidateModal()">取消</button>
                         <button class="btn btn-primary" onclick="doConsolidate()">开始整理</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 整库重整弹窗 -->
+            <div id="rebuildModal" class="modal" style="display:none;">
+                <div class="modal-content modal-wide">
+                    <h3>整库重整 · Dry Run</h3>
+                    <p>模型会重新审查全部活跃记忆，生成 KEEP / MERGE / EVENT / DISCARD 方案。</p>
+                    <p class="hint">这里只生成可审阅方案，不会修改或删除任何记忆。方案会保存到数据库，Render 重启也不会丢。</p>
+                    <div id="rebuildStatus" style="margin: 14px 0; color: var(--text-light);">尚未运行</div>
+                    <div id="rebuildSummary" class="card" style="display:none; padding:14px; margin:12px 0;"></div>
+                    <div id="rebuildPlanPreview" style="max-height:420px; overflow:auto;"></div>
+                    <div class="modal-actions">
+                        <button class="btn btn-secondary" onclick="closeRebuildModal()">关闭</button>
+                        <button class="btn btn-primary" id="startRebuildBtn" onclick="startMemoryRebuild()">生成重整方案</button>
                     </div>
                 </div>
             </div>
@@ -671,6 +688,6 @@
         </main>
     </div>
 
-    <script src="/static/js/dashboard.js?v=4.0.3.2"></script>
+    <script src="/static/js/dashboard.js?v=4.0.3.3"></script>
 </body>
 </html>

@@ -834,6 +834,125 @@ async function doConsolidate() {
 }
 
 // ============================================
+// 整库重整 Dry Run
+// ============================================
+let rebuildPollTimer = null;
+
+function openRebuildModal() {
+    document.getElementById('rebuildModal').style.display = 'flex';
+    refreshMemoryRebuildStatus();
+}
+
+function closeRebuildModal() {
+    document.getElementById('rebuildModal').style.display = 'none';
+}
+
+async function startMemoryRebuild() {
+    const btn = document.getElementById('startRebuildBtn');
+    btn.disabled = true;
+    document.getElementById('rebuildStatus').textContent = '正在启动整库重整...';
+    document.getElementById('rebuildSummary').style.display = 'none';
+    document.getElementById('rebuildPlanPreview').innerHTML = '';
+    try {
+        const resp = await fetch('/api/memories/rebuild/preview', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'}
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        startMemoryRebuildPolling();
+    } catch (e) {
+        btn.disabled = false;
+        document.getElementById('rebuildStatus').textContent = '❌ ' + e.message;
+    }
+}
+
+function startMemoryRebuildPolling() {
+    if (rebuildPollTimer) clearInterval(rebuildPollTimer);
+    refreshMemoryRebuildStatus();
+    rebuildPollTimer = setInterval(refreshMemoryRebuildStatus, 3000);
+}
+
+async function refreshMemoryRebuildStatus() {
+    try {
+        const resp = await fetch('/api/memories/rebuild/status');
+        const status = await resp.json();
+        const statusEl = document.getElementById('rebuildStatus');
+        const btn = document.getElementById('startRebuildBtn');
+
+        if (status.running) {
+            btn.disabled = true;
+            const phaseNames = {
+                loading: '读取记忆',
+                classifying: '逐条判断长期价值',
+                synthesizing: '合并与事件化'
+            };
+            const phase = phaseNames[status.phase] || status.phase || '处理中';
+            statusEl.textContent = '⏳ ' + phase + '：' + (status.processed || 0) + '/' + (status.total || 0);
+            return;
+        }
+
+        btn.disabled = false;
+        if (rebuildPollTimer) {
+            clearInterval(rebuildPollTimer);
+            rebuildPollTimer = null;
+        }
+        if (status.error) {
+            statusEl.textContent = '❌ Dry Run 失败：' + status.error;
+            return;
+        }
+        if (status.plan_id) {
+            statusEl.textContent = '✅ Dry Run 已完成，方案 #' + status.plan_id;
+            await loadMemoryRebuildPlan(status.plan_id);
+        } else {
+            statusEl.textContent = '尚未运行';
+        }
+    } catch (e) {
+        document.getElementById('rebuildStatus').textContent = '❌ 状态查询失败：' + e.message;
+    }
+}
+
+async function loadMemoryRebuildPlan(planId) {
+    const resp = await fetch('/api/memories/rebuild/plan/' + planId);
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+
+    const summary = data.summary || {};
+    const summaryEl = document.getElementById('rebuildSummary');
+    summaryEl.style.display = 'block';
+    summaryEl.innerHTML =
+        '<strong>方案 #' + data.id + '</strong><br>' +
+        '来源 ' + (summary.source_count || 0) + ' 条 → 预计活跃 ' +
+        (summary.estimated_active_after || 0) + ' 条；归档 ' +
+        (summary.discarded_sources || 0) + ' 条；合并动作 ' +
+        (summary.merge_actions || 0) + '；事件动作 ' +
+        (summary.event_actions || 0) + '。';
+
+    const sourceMap = new Map((allMemories || []).map(m => [m.id, m]));
+    const actions = (data.plan && data.plan.actions) || [];
+    const html = actions.map((action, index) => {
+        const sources = (action.source_ids || []).map(id => {
+            const mem = sourceMap.get(id);
+            const text = mem ? mem.content : ('#' + id);
+            return '<div style="margin:4px 0;color:var(--text-light);">#' + id + ' · ' +
+                escapeHtml(String(text).slice(0, 180)) + '</div>';
+        }).join('');
+        const proposed = action.content
+            ? '<div style="margin-top:8px;"><strong>→ ' + escapeHtml(action.title || '') +
+              '</strong><div>' + escapeHtml(action.content) + '</div></div>'
+            : '';
+        return '<div class="card" style="padding:12px;margin:8px 0;">' +
+            '<div><strong>' + (index + 1) + '. ' + escapeHtml(action.action) +
+            '</strong> · layer ' + escapeHtml(String(action.target_layer || '-')) + '</div>' +
+            sources + proposed +
+            '<div style="margin-top:8px;color:var(--text-muted);font-size:13px;">理由：' +
+            escapeHtml(action.reason || '未提供') + '</div></div>';
+    }).join('');
+    document.getElementById('rebuildPlanPreview').innerHTML = html ||
+        '<div class="hint">方案中没有动作。</div>';
+}
+
+// ============================================
 // 清理归档碎片
 // ============================================
 async function cleanupOldFragments() {

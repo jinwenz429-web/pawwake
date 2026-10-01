@@ -43,6 +43,11 @@ from database import init_tables, close_pool, save_message, search_memories, sav
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
+from memory_rebuilder import (
+    start_memory_rebuild_preview,
+    get_memory_rebuild_status,
+    get_memory_rebuild_plan,
+)
 from diary_store import ensure_dylan_diary_table, save_dylan_diary
 
 logger = logging.getLogger(__name__)
@@ -390,6 +395,11 @@ async def lifespan(app: FastAPI):
                 print(f"ℹ️  记忆提取+注入已关闭（MEMORY_EXTRACT_ENABLED=false）")
         else:
             print("ℹ️  记忆系统已关闭；Dashboard 配置与对话线状态仍可用")
+
+        # 一次性整库重整 dry-run，可在记忆系统关闭时安全运行。
+        if os.getenv("MEMORY_REBUILD_ON_START", "").strip().lower() == "preview":
+            rebuild_start = start_memory_rebuild_preview()
+            print(f"🧠 已启动整库重整 dry-run: {rebuild_start.get('status')}")
 
         if _db_module.CONVERSATION_RECALL_ENABLED:
             updated_tsv = await rebuild_content_tsv()
@@ -2415,6 +2425,31 @@ async def api_batch_restore(request: Request):
         return {"error": "未选择记忆"}
     restored = await restore_archived_memories_batch(ids)
     return {"status": "ok", "restored": restored}
+
+
+# ============================================================
+# 整库重整（只生成可审阅 dry-run plan，不直接改记忆）
+# ============================================================
+
+@app.post("/api/memories/rebuild/preview")
+async def api_memory_rebuild_preview():
+    """启动整库重整 dry-run；即使 MEMORY_ENABLED=false 也允许维修。"""
+    return start_memory_rebuild_preview()
+
+
+@app.get("/api/memories/rebuild/status")
+async def api_memory_rebuild_status():
+    """查询整库重整进度与最近一次 plan 摘要。"""
+    return get_memory_rebuild_status()
+
+
+@app.get("/api/memories/rebuild/plan/{plan_id}")
+async def api_memory_rebuild_plan(plan_id: int):
+    """读取持久化的重整方案，供 Dashboard 人工审阅。"""
+    plan = await get_memory_rebuild_plan(plan_id)
+    if not plan:
+        return JSONResponse(status_code=404, content={"error": "重整方案不存在"})
+    return plan
 
 
 # ============================================================
