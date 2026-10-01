@@ -295,18 +295,25 @@ async def lifespan(app: FastAPI):
             except ValueError:
                 dedupe_threshold = 0.88
             dedupe_threshold = min(1.0, max(0.5, dedupe_threshold))
-            dedupe_result = await dedupe_active_fragment_memories(
-                threshold=dedupe_threshold,
-                apply=(dedupe_mode == "apply"),
-            )
-            print(
-                "🧹 记忆去重维护："
-                f"mode={dedupe_result['mode']}, "
-                f"scanned={dedupe_result['active_fragments_scanned']}, "
-                f"groups={dedupe_result['duplicate_groups']}, "
-                f"duplicates={dedupe_result['duplicates_found']}, "
-                f"threshold={dedupe_result['threshold']}"
-            )
+
+            async def run_startup_dedupe():
+                try:
+                    dedupe_result = await dedupe_active_fragment_memories(
+                        threshold=dedupe_threshold,
+                        apply=(dedupe_mode == "apply"),
+                    )
+                    print(
+                        "🧹 记忆去重维护："
+                        f"mode={dedupe_result['mode']}, "
+                        f"scanned={dedupe_result['active_fragments_scanned']}, "
+                        f"groups={dedupe_result['duplicate_groups']}, "
+                        f"duplicates={dedupe_result['duplicates_found']}, "
+                        f"threshold={dedupe_result['threshold']}"
+                    )
+                except Exception as e:
+                    print(f"⚠️ 记忆去重维护失败: {e}")
+
+            asyncio.create_task(run_startup_dedupe())
 
         await ensure_dylan_diary_table()
         await ensure_token_usage_table()

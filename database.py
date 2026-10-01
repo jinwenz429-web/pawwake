@@ -1333,6 +1333,11 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
             "similarity": None,
         }
 
+    new_keywords = sorted(
+        set(extract_search_keywords(clean_content)),
+        key=lambda value: (-len(value), value),
+    )[:8]
+
     pool = await get_pool()
     embedding_refresh_id = None
     result = None
@@ -1343,12 +1348,27 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                 "SELECT pg_advisory_xact_lock($1)",
                 _MEMORY_DEDUP_LOCK_KEY,
             )
-            rows = await conn.fetch("""
-                SELECT id, content, importance, layer
-                FROM memories
-                WHERE is_active = TRUE
-                ORDER BY layer DESC, id DESC
-            """)
+            if new_keywords:
+                where_parts = [
+                    f"content ILIKE '%' || ${index + 1} || '%'"
+                    for index in range(len(new_keywords))
+                ]
+                rows = await conn.fetch(
+                    f"""SELECT id, content, importance, layer
+                        FROM memories
+                        WHERE is_active = TRUE
+                          AND ({' OR '.join(where_parts)})
+                        ORDER BY layer DESC, id DESC
+                        LIMIT 300""",
+                    *new_keywords,
+                )
+            else:
+                rows = await conn.fetch("""
+                    SELECT id, content, importance, layer
+                    FROM memories
+                    WHERE is_active = TRUE
+                    ORDER BY layer DESC, id DESC
+                """)
 
             matched = None
             for row in rows:
@@ -1449,27 +1469,53 @@ async def dedupe_active_fragment_memories(
                 ORDER BY id
             """)
 
-            groups = []
+            negation_markers = (
+                "不喜欢", "不想", "不要", "没有", "从不",
+                "讨厌", "拒绝", "停止", "戒掉", "不",
+            )
+            prepared = []
             for row in rows:
-                row_dict = dict(row)
+                item = dict(row)
+                item["_norm"] = _normalize_memory_text(item["content"] or "")
+                item["_keywords"] = set(extract_search_keywords(item["content"] or ""))
+                item["_has_negation"] = any(
+                    marker in str(item["content"] or "")
+                    for marker in negation_markers
+                )
+                prepared.append(item)
+
+            def prepared_is_duplicate(left: dict, right: dict) -> bool:
+                left_norm = left["_norm"]
+                right_norm = right["_norm"]
+                if not left_norm or not right_norm:
+                    return False
+                if left_norm == right_norm:
+                    return True
+                if min(len(left_norm), len(right_norm)) >= 8:
+                    if left_norm in right_norm or right_norm in left_norm:
+                        return True
+                if left["_has_negation"] != right["_has_negation"]:
+                    return False
+                left_keywords = left["_keywords"]
+                right_keywords = right["_keywords"]
+                if not left_keywords or not right_keywords:
+                    return False
+                similarity = len(left_keywords & right_keywords) / max(
+                    1, len(left_keywords | right_keywords)
+                )
+                return similarity >= threshold
+
+            groups = []
+            for item in prepared:
                 target_group = None
                 for group in groups:
-                    for member in group:
-                        reason, _ = _memory_duplicate_relation(
-                            row_dict["content"] or "",
-                            member["content"] or "",
-                            threshold,
-                        )
-                        if reason:
-                            target_group = group
-                            break
-                    if target_group is not None:
+                    if any(prepared_is_duplicate(item, member) for member in group):
+                        target_group = group
                         break
-
                 if target_group is None:
-                    groups.append([row_dict])
+                    groups.append([item])
                 else:
-                    target_group.append(row_dict)
+                    target_group.append(item)
 
             duplicate_groups = [group for group in groups if len(group) > 1]
             plan = []
