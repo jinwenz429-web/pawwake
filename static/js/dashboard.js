@@ -838,6 +838,21 @@ async function doConsolidate() {
 // ============================================
 let rebuildPollTimer = null;
 
+async function rebuildFetchJson(url, options = undefined) {
+    const resp = await fetch(url, options);
+    const raw = await resp.text();
+    let data;
+    try {
+        data = raw ? JSON.parse(raw) : {};
+    } catch (_) {
+        throw new Error('后端返回非 JSON（HTTP ' + resp.status + '）：' + (raw || '空响应').slice(0, 120));
+    }
+    if (!resp.ok) {
+        throw new Error(data.error || data.detail || ('HTTP ' + resp.status));
+    }
+    return data;
+}
+
 function openRebuildModal() {
     document.getElementById('rebuildModal').style.display = 'flex';
     refreshMemoryRebuildStatus();
@@ -854,11 +869,10 @@ async function startMemoryRebuild() {
     document.getElementById('rebuildSummary').style.display = 'none';
     document.getElementById('rebuildPlanPreview').innerHTML = '';
     try {
-        const resp = await fetch('/api/memories/rebuild/preview', {
+        const data = await rebuildFetchJson('/api/memories/rebuild/preview', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'}
         });
-        const data = await resp.json();
         if (data.error) throw new Error(data.error);
         startMemoryRebuildPolling();
     } catch (e) {
@@ -875,8 +889,7 @@ function startMemoryRebuildPolling() {
 
 async function refreshMemoryRebuildStatus() {
     try {
-        const resp = await fetch('/api/memories/rebuild/status');
-        const status = await resp.json();
+        const status = await rebuildFetchJson('/api/memories/rebuild/status');
         const statusEl = document.getElementById('rebuildStatus');
         const btn = document.getElementById('startRebuildBtn');
 
@@ -913,8 +926,7 @@ async function refreshMemoryRebuildStatus() {
 }
 
 async function loadMemoryRebuildPlan(planId) {
-    const resp = await fetch('/api/memories/rebuild/plan/' + planId);
-    const data = await resp.json();
+    const data = await rebuildFetchJson('/api/memories/rebuild/plan/' + planId);
     if (data.error) throw new Error(data.error);
 
     const summary = data.summary || {};

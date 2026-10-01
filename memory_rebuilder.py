@@ -510,8 +510,47 @@ def start_memory_rebuild_preview():
     return {"status": "started"}
 
 
-def get_memory_rebuild_status():
-    return dict(_status)
+def _jsonb_object(value):
+    """asyncpg 默认会把 JSON/JSONB 返回为字符串；统一还原为 dict。"""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError(f"JSONB 字段不是对象: {type(value).__name__}")
+
+
+async def get_memory_rebuild_status():
+    """返回当前任务状态；进程重启后自动回退到 Neon 中最近一次持久化方案。"""
+    result = dict(_status)
+    if result.get("running") or result.get("plan_id") or result.get("error"):
+        return result
+
+    await ensure_rebuild_table()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, summary
+               FROM memory_rebuild_plans
+               ORDER BY id DESC
+               LIMIT 1"""
+        )
+    if not row:
+        return result
+
+    summary = _jsonb_object(row["summary"])
+    source_count = int(summary.get("source_count") or 0)
+    result.update({
+        "phase": "done",
+        "processed": source_count,
+        "total": source_count,
+        "plan_id": int(row["id"]),
+        "summary": summary,
+    })
+    return result
 
 
 async def get_memory_rebuild_plan(plan_id: int):
@@ -530,7 +569,7 @@ async def get_memory_rebuild_plan(plan_id: int):
         "created_at": row["created_at"].isoformat(),
         "status": row["status"],
         "source_count": int(row["source_count"]),
-        "summary": dict(row["summary"] or {}),
-        "plan": dict(row["plan"] or {}),
+        "summary": _jsonb_object(row["summary"]),
+        "plan": _jsonb_object(row["plan"]),
         "applied_at": row["applied_at"].isoformat() if row["applied_at"] else None,
     }

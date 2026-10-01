@@ -2440,7 +2440,7 @@ async def api_memory_rebuild_preview():
 @app.get("/api/memories/rebuild/status")
 async def api_memory_rebuild_status():
     """查询整库重整进度与最近一次 plan 摘要。"""
-    return get_memory_rebuild_status()
+    return await get_memory_rebuild_status()
 
 
 @app.get("/api/memories/rebuild/plan/{plan_id}")
