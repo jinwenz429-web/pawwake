@@ -41,6 +41,15 @@ class _FakeAsyncClient:
         return _FakeResponse()
 
 
+class _CapturingAsyncClient(_FakeAsyncClient):
+    def __init__(self):
+        self.sent_body = None
+
+    async def post(self, *args, **kwargs):
+        self.sent_body = copy.deepcopy(kwargs["json"])
+        return _FakeResponse()
+
+
 class _MemoryConnection:
     def __init__(self):
         self.states = {}
@@ -206,6 +215,164 @@ class SessionResolutionTests(unittest.TestCase):
             log_text,
         )
         self.assertNotIn("header-session-secret", log_text)
+
+
+class PartitionRerollTests(unittest.TestCase):
+    def _sent_messages(self, history, client_messages):
+        client = _CapturingAsyncClient()
+
+        async def fake_history(session_id, limit=10000):
+            now = datetime.now(timezone.utc)
+            return [dict(m, id=i + 1,
+                         metadata=json.dumps({"tool_calls": m["tool_calls"]})
+                         if m.get("tool_calls") else None, created_at=now)
+                    for i, m in enumerate(history)]
+
+        async def fake_cache_state(session_id):
+            return {"summary_parts": [], "a_start_round": 0}
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(main, "CACHE_PARTITION_ENABLED", True))
+            stack.enter_context(patch.object(main, "CACHE_PARTITION_X", 15))
+            stack.enter_context(patch.object(main, "MEMORY_ENABLED", False))
+            stack.enter_context(patch.object(main, "FORCE_STREAM", False))
+            stack.enter_context(patch.object(main, "get_system_prompt", lambda: asyncio.sleep(0, result="")))
+            stack.enter_context(patch.object(main, "get_conversation_messages", fake_history))
+            stack.enter_context(patch.object(main, "get_session_cache_state", fake_cache_state))
+            stack.enter_context(patch.object(main, "build_conversation_recall_text", lambda *a: asyncio.sleep(0, result=("", []))))
+            stack.enter_context(patch.object(main, "conversation_persistence_enabled", lambda: False))
+            stack.enter_context(patch.object(main.httpx, "AsyncClient", lambda *a, **kw: client))
+            response = asyncio.run(main._chat_completions_inner(_FakeRequest(
+                {"messages": client_messages, "model": "test-model", "stream": False},
+                {"X-Conversation-Id": "same-session"},
+            )))
+        self.assertEqual(response.status_code, 200)
+        return client.sent_body["messages"]
+
+    def test_gateway_excludes_rolled_away_reply_but_keeps_intentional_repeat(self):
+        db = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "earlier reply"},
+            {"role": "user", "content": "echo"},
+            {"role": "assistant", "content": "ROLLED_AWAY_REPLY"},
+        ]
+        reroll = self._sent_messages(db, db[:2] + [{"role": "user", "content": "echo"}])
+        repeat = self._sent_messages(db, db + [{"role": "user", "content": "echo"}])
+        self.assertEqual(sum("echo" in str(m.get("content", "")) for m in reroll), 1)
+        self.assertFalse(any(m.get("content") == "ROLLED_AWAY_REPLY" for m in reroll))
+        self.assertEqual(sum("echo" in str(m.get("content", "")) for m in repeat), 2)
+        self.assertTrue(any(m.get("content") == "ROLLED_AWAY_REPLY" for m in repeat))
+
+    def test_request_history_distinguishes_reroll_from_intentional_repeat(self):
+        db = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "earlier reply"},
+            {"role": "user", "content": "echo"},
+            {"role": "assistant", "content": "old reply"},
+        ]
+        reroll = db[:2] + [{"role": "user", "content": "echo"}]
+        repeat = db + [{"role": "user", "content": "echo"}]
+        self.assertTrue(main.is_partition_reroll(db, reroll))
+        self.assertFalse(main.is_partition_reroll(db, repeat))
+        self.assertFalse(main.is_partition_reroll(db, [{"role": "user", "content": "echo"}]))
+
+    def test_matching_repeated_pattern_is_ambiguous_and_kept(self):
+        db = [
+            {"role": "user", "content": "echo"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "echo"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        client = db[2:] + [{"role": "user", "content": "echo"}]
+        self.assertFalse(main.is_partition_reroll(db, client))
+
+    def test_prior_tool_round_is_excluded_only_with_history_evidence(self):
+        db = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "earlier reply"},
+            {"role": "user", "content": "echo"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "old-call"}]},
+            {"role": "tool", "content": "old result", "tool_call_id": "old-call"},
+            {"role": "assistant", "content": "old reply"},
+        ]
+        client = db[:2] + [{"role": "user", "content": "echo"}]
+        self.assertTrue(main.is_partition_reroll(db, client))
+        sent = self._sent_messages(db, client)
+        serialized = json.dumps(sent)
+        self.assertNotIn("old-call", serialized)
+        self.assertNotIn("old result", serialized)
+        self.assertNotIn("old reply", serialized)
+
+    def test_storage_replaces_only_confirmed_reroll_and_keeps_repeated_user_turn(self):
+        calls = []
+
+        async def fake_replace(*args, **kwargs):
+            calls.append(("replace", args))
+            return True
+
+        async def fake_save(*args, **kwargs):
+            calls.append(("save", args))
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(main, "MEMORY_ENABLED", False))
+            stack.enter_context(patch.object(main, "save_message", fake_save))
+            stack.enter_context(patch.object(main, "replace_last_conversation_round", fake_replace))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            asyncio.run(main.process_memories_background(
+                "same-session", "echo", "new reply", "test-model", reroll=True,
+                reroll_expected_assistant_id=42,
+            ))
+            asyncio.run(main.process_memories_background(
+                "same-session", "echo", "next reply", "test-model", reroll=False,
+            ))
+
+        self.assertEqual([name for name, _ in calls], ["replace", "save", "save"])
+        self.assertEqual(calls[1][1][1:3], ("user", "echo"))
+        self.assertEqual(calls[2][1][1:3], ("assistant", "next reply"))
+
+    def test_round_replacement_requires_the_answer_seen_by_the_request(self):
+        class Connection:
+            def __init__(self):
+                self.executed = []
+
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def fetchrow(self, query, *args):
+                if "role = 'user'" in query:
+                    return {"id": 10, "content": "echo"}
+                return {"id": 13, "role": "assistant"}
+
+            async def execute(self, query, *args):
+                self.executed.append((query, args))
+
+        class Pool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return _AcquireConnection(self.connection)
+
+        connection = Connection()
+        with patch.object(database, "get_pool", return_value=Pool(connection)):
+            self.assertFalse(asyncio.run(database.replace_last_conversation_round(
+                "same-session", "echo", "new reply", expected_assistant_id=12,
+            )))
+            self.assertFalse(any("DELETE FROM conversations" in query
+                                 for query, _ in connection.executed))
+            self.assertTrue(asyncio.run(database.replace_last_conversation_round(
+                "same-session", "echo", "new reply", expected_assistant_id=13,
+            )))
+        deletes = [(query, args) for query, args in connection.executed
+                   if "DELETE FROM conversations" in query]
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(deletes[0][1], ("same-session", 10, 13))
 
 
 class SessionStateIsolationTests(unittest.TestCase):

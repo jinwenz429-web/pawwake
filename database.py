@@ -668,16 +668,18 @@ async def save_message(session_id: str, role: str, content: str, model: str = ""
     )
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """INSERT INTO conversations (
-                   session_id, role, content, model, metadata, content_tsv
-               ) VALUES (
-                   $1, $2, $3, $4, $5,
-                   array_to_tsvector(string_to_array($6, ' '))
-               )
-               RETURNING id""",
-            session_id, role, content, model, metadata, tsv_text,
-        )
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            row = await conn.fetchrow(
+                """INSERT INTO conversations (
+                       session_id, role, content, model, metadata, content_tsv
+                   ) VALUES (
+                       $1, $2, $3, $4, $5,
+                       array_to_tsvector(string_to_array($6, ' '))
+                   )
+                   RETURNING id""",
+                session_id, role, content, model, metadata, tsv_text,
+            )
     message_id = row["id"] if row else None
     if (
         message_id is not None
@@ -688,6 +690,53 @@ async def save_message(session_id: str, role: str, content: str, model: str = ""
     ):
         kick_embedding_backfill()
     return message_id
+
+
+async def replace_last_conversation_round(
+    session_id: str, expected_user_content: str, assistant_content: str,
+    model: str = "", metadata: str = None,
+    expected_assistant_id: int = None,
+) -> bool:
+    """Atomically replace the response (including tools) after the last user row."""
+    tsv_text = (
+        jieba_tokenize_for_tsv(assistant_content or "")
+        if CONVERSATION_RECALL_ENABLED else None
+    )
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            user = await conn.fetchrow(
+                """SELECT id, content FROM conversations
+                   WHERE session_id = $1 AND role = 'user'
+                   ORDER BY id DESC LIMIT 1 FOR UPDATE""", session_id,
+            )
+            latest = await conn.fetchrow(
+                """SELECT id, role FROM conversations
+                   WHERE session_id = $1 ORDER BY id DESC LIMIT 1""", session_id,
+            )
+            if (
+                not user or not latest or expected_assistant_id is None
+                or user["content"] != expected_user_content
+                or latest["role"] != "assistant" or latest["id"] <= user["id"]
+                or latest["id"] != expected_assistant_id
+            ):
+                return False
+            await conn.execute(
+                """DELETE FROM conversations
+                   WHERE session_id = $1 AND id > $2 AND id <= $3""",
+                session_id, user["id"], expected_assistant_id,
+            )
+            await conn.execute(
+                """INSERT INTO conversations
+                   (session_id, role, content, model, metadata, content_tsv)
+                   VALUES ($1, 'assistant', $2, $3, $4,
+                           array_to_tsvector(string_to_array($5, ' ')))""",
+                session_id, assistant_content, model, metadata, tsv_text,
+            )
+    if CONVERSATION_RECALL_ENABLED and EMBEDDING_API_KEY and assistant_content.strip():
+        kick_embedding_backfill()
+    return True
 
 
 async def get_last_user_content(session_id: str) -> str:
@@ -2492,10 +2541,10 @@ async def get_conversation_messages(session_id: str, limit: int = 100):
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT role, content, metadata, created_at
+            SELECT id, role, content, metadata, created_at
             FROM conversations
             WHERE session_id = $1
-            ORDER BY created_at ASC
+            ORDER BY created_at ASC, id ASC
             LIMIT $2
         """, session_id, limit)
         return [dict(r) for r in rows]

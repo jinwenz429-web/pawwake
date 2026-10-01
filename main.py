@@ -39,7 +39,7 @@ from database import (
     repair_broken_merge_references,
     search_memories_with_mode,
 )
-from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, delete_conversation, batch_delete_conversations, merge_sessions_to_target, list_all_session_cache_states, export_all_conversations, import_conversations, get_last_user_content, update_last_assistant_message, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
+from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, replace_last_conversation_round, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
@@ -908,6 +908,48 @@ def group_by_rounds(history: list) -> list:
     return rounds
 
 
+def is_partition_reroll(db_messages: list, client_messages: list) -> bool:
+    """Recognize a replaced final answer from the client's visible history.
+
+    Equal user text alone is ambiguous. Kelivo sends the previous answer for a
+    new turn but omits the answer being regenerated. If the request has too
+    little history to establish that distinction, keep it as a new turn.
+    """
+    db = [m for m in db_messages if m.get("role") != "system"]
+    client = [m for m in client_messages if m.get("role") != "system"]
+    if not db or not client or db[-1].get("role") != "assistant" or db[-1].get("tool_calls"):
+        return False
+    if client[-1].get("role") != "user" or not isinstance(client[-1].get("content"), str):
+        return False
+    last_user_index = next((i for i in range(len(db) - 1, -1, -1)
+                            if db[i].get("role") == "user"), -1)
+    if last_user_index < 0 or db[last_user_index].get("content") != client[-1]["content"]:
+        return False
+    if len(client) > 1 and client[-2].get("role") == "user":
+        return False
+
+    def visible(messages):
+        return [
+            (m.get("role"), m.get("content"))
+            for m in messages
+            if m.get("role") in ("user", "assistant")
+            and not m.get("tool_calls")
+            and isinstance(m.get("content"), str)
+            and m.get("content")
+        ]
+
+    client_prior = visible(client[:-1])
+    db_prior = visible(db[:last_user_index])
+    db_full = visible(db)
+    if not client_prior or client_prior[-1][0] != "assistant":
+        return False
+    if len(client_prior) > len(db_prior) or client_prior != db_prior[-len(client_prior):]:
+        return False
+    # If the same visible pattern could be the completed latest round, avoid
+    # treating an intentional repetition as regeneration.
+    return client_prior != db_full[-len(client_prior):]
+
+
 def _build_memory_extraction_messages(
     context_messages: list,
     assistant_msg: str,
@@ -1350,6 +1392,8 @@ async def process_memories_background(
     tool_messages: list = None,
     assistant_tool_calls: list = None,
     assistant_reasoning: str = None,
+    reroll: bool = False,
+    reroll_expected_assistant_id: int = None,
 ):
     """
     后台异步：存储对话 + 提取记忆（不阻塞主流程）
@@ -1422,24 +1466,20 @@ async def process_memories_background(
                 ast_meta_dict["reasoning_content"] = assistant_reasoning
             assistant_meta = json.dumps(ast_meta_dict) if ast_meta_dict else None
             
-            if assistant_tool_calls:
-                # 首次工具调用：assistant回复包含tool_calls，存user + assistant(tool_calls)
+            replaced = False
+            if reroll:
+                replaced = await replace_last_conversation_round(
+                    session_id, user_msg, assistant_msg or "", model, assistant_meta,
+                    expected_assistant_id=reroll_expected_assistant_id,
+                )
+                if replaced:
+                    print("🔄 已替换上次回复及其工具消息")
+            if not replaced:
+                # 相同文字也可能是用户有意重复，只有明确的重生成才替换。
                 await save_message(session_id, "user", user_msg, model)
                 await save_message(session_id, "assistant", assistant_msg or "", model, metadata=assistant_meta)
-                print(f"🔧 存储: user + assistant (含{len(assistant_tool_calls)}个tool_calls)" + (" (含reasoning)" if assistant_reasoning else ""))
-            else:
-                # 纯文字对话：re-roll检测 + 存user + assistant
-                last_user = await get_last_user_content(session_id)
-                if last_user and last_user.strip() == user_msg.strip():
-                    updated = await update_last_assistant_message(session_id, assistant_msg, model)
-                    if updated:
-                        print(f"🔄 检测到re-roll，已覆盖最后一条assistant回复")
-                    else:
-                        await save_message(session_id, "user", user_msg, model)
-                        await save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
-                else:
-                    await save_message(session_id, "user", user_msg, model)
-                    await save_message(session_id, "assistant", assistant_msg, model, metadata=assistant_meta)
+                if assistant_tool_calls:
+                    print(f"🔧 存储: user + assistant (含{len(assistant_tool_calls)}个tool_calls)" + (" (含reasoning)" if assistant_reasoning else ""))
         
         # 2. 检查是否需要提取记忆
         if not MEMORY_ENABLED:
@@ -1649,6 +1689,8 @@ async def _chat_completions_inner(request: Request):
     original_messages = [msg for msg in messages if msg.get("role") != "system"]
     extraction_context_messages = original_messages
     extraction_round_count = None
+    partition_reroll = False
+    reroll_expected_assistant_id = None
     resolved_system_prompt = "" if skip_conversation_log else await get_system_prompt()
     
     # ---------- 检测工具调用消息 ----------
@@ -1689,6 +1731,13 @@ async def _chat_completions_inner(request: Request):
                     }
                 },
             )
+
+        partition_reroll = is_partition_reroll(db_msgs, original_messages)
+        if partition_reroll:
+            reroll_expected_assistant_id = db_history[-1].get("id")
+            last_user_index = max(i for i, m in enumerate(db_msgs) if m.get("role") == "user")
+            db_msgs = db_msgs[:last_user_index]
+            print("🔄 分区模式: 客户端上下文表明正在重生成最后一条回复")
         
         # 提取客户端新消息（非system），可能是user、tool、或带tool_calls的assistant
         client_new_msgs = [m for m in messages if m.get("role") != "system"]
@@ -1902,6 +1951,8 @@ async def _chat_completions_inner(request: Request):
                 tool_messages,
                 pending_fragment_ids,
                 extraction_round_count,
+                partition_reroll,
+                reroll_expected_assistant_id,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -1944,7 +1995,9 @@ async def _chat_completions_inner(request: Request):
                                                     context_round_count=extraction_round_count,
                                                     skip_conversation_log=skip_conversation_log,
                                                     tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
-                                                    assistant_reasoning=assistant_reasoning)
+                                                    assistant_reasoning=assistant_reasoning,
+                                                    reroll=partition_reroll,
+                                                    reroll_expected_assistant_id=reroll_expected_assistant_id)
                     )
                 
                 return JSONResponse(status_code=200, content=resp_data)
@@ -1967,6 +2020,8 @@ async def stream_and_capture(
     tool_messages: list = None,
     pending_fragment_ids: list = None,
     extraction_round_count: int = None,
+    reroll: bool = False,
+    reroll_expected_assistant_id: int = None,
 ):
     """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
     full_response = []
@@ -2090,7 +2145,9 @@ async def stream_and_capture(
                                         context_round_count=extraction_round_count,
                                         skip_conversation_log=skip_conversation_log,
                                         tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
-                                        assistant_reasoning=assistant_reasoning)
+                                        assistant_reasoning=assistant_reasoning,
+                                        reroll=reroll,
+                                        reroll_expected_assistant_id=reroll_expected_assistant_id)
         )
 
 
