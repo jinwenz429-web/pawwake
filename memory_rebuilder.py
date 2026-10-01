@@ -227,7 +227,7 @@ async def _classify_batch(items):
         "event_date": item["event_date"],
     } for item in items]
     result = await _post_json_array(
-        CLASSIFY_PROMPT.format(items=_json_text(payload)),
+        CLASSIFY_PROMPT.replace("{items}", _json_text(payload)),
         "记忆分类",
     )
     return _validate_classification(items, result)
@@ -317,7 +317,7 @@ async def _synthesize_once(candidates, label):
     } for item in candidates]
     source_ids = [item["id"] for item in candidates]
     result = await _post_json_array(
-        SYNTHESIZE_PROMPT.format(items=_json_text(payload)),
+        SYNTHESIZE_PROMPT.replace("{items}", _json_text(payload)),
         label,
     )
     return _validate_actions(source_ids, result)
