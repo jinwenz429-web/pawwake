@@ -49,7 +49,9 @@ def _tool_call(call_id):
     }
 
 
-def _db_history():
+def _db_history(tool_calls=None):
+    if tool_calls is None:
+        tool_calls = [_tool_call("call_a"), _tool_call("call_b"), _tool_call("call_c")]
     return [
         {
             "role": "user",
@@ -61,7 +63,7 @@ def _db_history():
             "role": "assistant",
             "content": "",
             "metadata": json.dumps(
-                {"tool_calls": [_tool_call("call_a"), _tool_call("call_b"), _tool_call("call_c")]}
+                {"tool_calls": tool_calls}
             ),
             "created_at": None,
         },
@@ -76,9 +78,12 @@ class ToolResultReconciliationTests(unittest.TestCase):
     def setUp(self):
         _RecordingAsyncClient.posted_bodies = []
 
-    def _run_request(self, tool_messages):
+    def _run_request(self, tool_messages, tool_calls=None, real_partition=False):
         async def fake_get_conversation_messages(session_id, limit=10000):
-            return _db_history()
+            return _db_history(tool_calls)
+
+        async def fake_get_session_cache_state(session_id):
+            return {"summary_parts": [], "a_start_round": 0}
 
         def fake_db_row_to_message(row):
             message = {"role": row["role"], "content": row["content"]}
@@ -104,7 +109,11 @@ class ToolResultReconciliationTests(unittest.TestCase):
             stack.enter_context(patch.object(main, "get_conversation_messages", fake_get_conversation_messages))
             stack.enter_context(patch.object(main, "db_row_to_message", fake_db_row_to_message))
             stack.enter_context(patch.object(main, "build_conversation_recall_text", unittest.mock.AsyncMock(return_value=("", []))))
-            stack.enter_context(patch.object(main, "build_partitioned_messages", _identity_partition_messages))
+            if real_partition:
+                stack.enter_context(patch.object(main, "CACHE_PARTITION_X", 15))
+                stack.enter_context(patch.object(main, "get_session_cache_state", fake_get_session_cache_state))
+            else:
+                stack.enter_context(patch.object(main, "build_partitioned_messages", _identity_partition_messages))
             stack.enter_context(patch.object(main, "conversation_persistence_enabled", return_value=False))
             stack.enter_context(patch.object(main.httpx, "AsyncClient", _RecordingAsyncClient))
             return asyncio.run(main._chat_completions_inner(request))
@@ -163,6 +172,113 @@ class ToolResultReconciliationTests(unittest.TestCase):
         self.assertEqual(payload["error"]["missing_tool_call_ids"], [])
         self.assertEqual(payload["error"]["duplicate_tool_call_ids"], ["call_a"])
         self.assertEqual(_RecordingAsyncClient.posted_bodies, [])
+
+    def test_client_trimmed_failed_call_gets_unknown_result(self):
+        response = self._run_request(
+            [
+                {"role": "assistant", "content": "", "tool_calls": [_tool_call("call_a"), _tool_call("call_b")]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "result-a"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "result-b"},
+            ]
+        )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = _RecordingAsyncClient.posted_bodies[0]["messages"]
+        self.assertEqual([m["tool_call_id"] for m in forwarded if m["role"] == "tool"],
+                         ["call_a", "call_b", "call_c"])
+        recovered = json.loads(forwarded[-1]["content"])
+        self.assertEqual(recovered["error"], "client_omitted_tool_result")
+        self.assertEqual(recovered["status"], "unknown")
+        self.assertIs(recovered["retryable"], False)
+        self.assertEqual(forwarded[-1]["name"], "tool_call_c")
+
+    def test_two_calls_one_result_recovers_with_real_partition_builder(self):
+        battery_call = _tool_call("call_b")
+        battery_call["function"]["name"] = "get_battery"
+        response = self._run_request(
+            [
+                {"role": "assistant", "content": "", "tool_calls": [_tool_call("call_a")]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "screen time result"},
+            ],
+            tool_calls=[_tool_call("call_a"), battery_call],
+            real_partition=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = _RecordingAsyncClient.posted_bodies[0]["messages"]
+        self.assertEqual([m["tool_call_id"] for m in forwarded if m["role"] == "tool"],
+                         ["call_a", "call_b"])
+        battery_result = next(m for m in forwarded if m.get("tool_call_id") == "call_b")
+        self.assertEqual(battery_result["name"], "get_battery")
+        self.assertEqual(json.loads(battery_result["content"])["status"], "unknown")
+
+    def test_new_user_closes_pending_turn_before_user_message(self):
+        response = self._run_request(
+            [
+                {"role": "tool", "tool_call_id": "call_a", "content": "result-a"},
+                {"role": "user", "content": "Can we continue?"},
+            ]
+        )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = _RecordingAsyncClient.posted_bodies[0]["messages"]
+        self.assertEqual([m["role"] for m in forwarded],
+                         ["user", "assistant", "tool", "tool", "tool", "user"])
+        self.assertEqual([m["tool_call_id"] for m in forwarded if m["role"] == "tool"],
+                         ["call_a", "call_b", "call_c"])
+        self.assertEqual(forwarded[-1]["content"], "Can we continue?")
+
+    def test_new_user_with_no_tool_results_closes_pending_turn(self):
+        response = self._run_request([{"role": "user", "content": "Please continue"}])
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = _RecordingAsyncClient.posted_bodies[0]["messages"]
+        self.assertEqual([m["tool_call_id"] for m in forwarded if m["role"] == "tool"],
+                         ["call_a", "call_b", "call_c"])
+        self.assertEqual(forwarded[-1]["content"], "Please continue")
+
+    def test_duplicate_result_stays_rejected_after_client_trims_call(self):
+        response = self._run_request(
+            [
+                {"role": "assistant", "content": "", "tool_calls": [_tool_call("call_a"), _tool_call("call_b")]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "result-a-1"},
+                {"role": "tool", "tool_call_id": "call_a", "content": "result-a-2"},
+                {"role": "tool", "tool_call_id": "call_b", "content": "result-b"},
+            ]
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(_RecordingAsyncClient.posted_bodies, [])
+
+    def test_followup_user_is_saved_after_recovered_tool_results(self):
+        saved = []
+
+        async def fake_save_message(session_id, role, content, model, metadata=None):
+            saved.append((role, content))
+
+        context = [
+            {"role": "assistant", "content": None, "tool_calls": [_tool_call("call_a")]},
+            {"role": "tool", "tool_call_id": "call_a", "content": "result-a"},
+            {"role": "user", "content": "Please continue"},
+        ]
+        with (
+            patch.object(main, "MEMORY_ENABLED", False),
+            patch.object(main, "save_message", fake_save_message),
+        ):
+            asyncio.run(main.process_memories_background(
+                "tool-test-session",
+                "Please continue",
+                "done",
+                "gemini-test",
+                context_messages=context,
+                tool_messages=[{"role": "tool", "tool_call_id": "call_a", "content": "result-a"}],
+            ))
+
+        self.assertEqual(saved, [
+            ("tool", "result-a"),
+            ("user", "Please continue"),
+            ("assistant", "done"),
+        ])
 
 
 if __name__ == "__main__":

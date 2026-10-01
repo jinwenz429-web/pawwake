@@ -1403,6 +1403,9 @@ async def process_memories_background(
                     meta_dict["name"] = tm["name"]
                 meta = json.dumps(meta_dict) if meta_dict else None
                 await save_message(session_id, "tool", tm.get("content", ""), model, metadata=meta)
+
+            if user_msg and context_messages and context_messages[-1].get("role") == "user":
+                await save_message(session_id, "user", user_msg, model)
             
             if assistant_msg or assistant_tool_calls:
                 ast_meta_dict = {}
@@ -1713,11 +1716,10 @@ async def _chat_completions_inner(request: Request):
             print(f"🔧 去重: 过滤{len(user_msgs)-len(tail_user_ids)}条冗余user，保留末尾连续{len(tail_user_ids)}条")
         # 工具结果轮次处理：基于DB状态 + 当前轮次tool_call_id精确判断
         client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
-        if client_tools:
+        db_last = db_msgs[-1] if db_msgs else None
+        db_expecting_tool = (db_last and db_last.get("role") == "assistant" and db_last.get("tool_calls"))
+        if client_tools or db_expecting_tool:
             # 判断DB是否处于"等待tool结果"状态（最后一条是assistant(tool_calls)）
-            db_last = db_msgs[-1] if db_msgs else None
-            db_expecting_tool = (db_last and db_last.get("role") == "assistant" and db_last.get("tool_calls"))
-            
             if not db_expecting_tool:
                 # DB不在等待tool结果 → 客户端的所有tool都是历史残留（含手动删除后的幽灵）
                 stale_ids = [m.get('tool_call_id', '?') for m in client_tools]
@@ -1734,6 +1736,43 @@ async def _chat_completions_inner(request: Request):
                     print(f"🔧 去重: 丢弃{len(stale_tools)}条非当前轮次tool (ids: {[m.get('tool_call_id','?') for m in stale_tools]})")
                 if new_tools:
                     print(f"🔧 保留{len(new_tools)}条当前轮次tool (ids: {[m.get('tool_call_id','?') for m in new_tools]})")
+
+                client_assistant = next(
+                    (m for m in reversed(messages) if m.get("role") == "assistant" and m.get("tool_calls")),
+                    None,
+                )
+                client_call_ids = {
+                    tc.get("id") for tc in client_assistant.get("tool_calls", []) if tc.get("id")
+                } if client_assistant else set()
+                expected_ids = [tc.get("id") for tc in expected_tool_calls if tc.get("id")]
+                new_tool_ids = {m.get("tool_call_id") for m in new_tools}
+                client_trimmed_turn = (
+                    client_call_ids
+                    and client_call_ids < set(expected_ids)
+                    and client_call_ids <= new_tool_ids
+                )
+                if missing_tool_ids and not duplicate_tool_ids and (tail_user_ids or client_trimmed_turn):
+                    missing_set = set(missing_tool_ids)
+                    for tool_call in expected_tool_calls:
+                        tool_call_id = tool_call.get("id")
+                        if tool_call_id not in missing_set:
+                            continue
+                        tool_name = tool_call.get("function", {}).get("name", "")
+                        new_tools.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": tool_name,
+                            "content": json.dumps({
+                                "error": "client_omitted_tool_result",
+                                "status": "unknown",
+                                "retryable": False,
+                                "message": "The client did not return this tool result. Do not assume the operation succeeded or retry side-effecting operations without user confirmation.",
+                            }),
+                        })
+                    result_by_id = {m["tool_call_id"]: m for m in new_tools}
+                    new_tools = [result_by_id[tool_call_id] for tool_call_id in expected_ids]
+                    missing_tool_ids = []
+                    print("🔧 已用状态未知的错误结果闭合客户端放弃的工具轮次")
 
                 if missing_tool_ids or duplicate_tool_ids:
                     expected_count = len([tc for tc in expected_tool_calls if tc.get("id")])
