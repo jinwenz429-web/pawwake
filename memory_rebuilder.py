@@ -1,7 +1,4 @@
-"""
-Pawwake memory rebuild planner.
-Creates a persistent, reviewable dry-run plan. It never mutates memories.
-"""
+"""Persistent memory rebuild previews and explicitly confirmed application."""
 
 import asyncio
 import hashlib
@@ -41,6 +38,10 @@ _status = {
     "summary": None,
     "error": None,
 }
+
+
+class RebuildApplyConflict(Exception):
+    """A rebuild plan was already applied or no longer matches active memories."""
 
 
 def _json_text(value) -> str:
@@ -123,6 +124,10 @@ async def ensure_rebuild_table():
                 plan JSONB NOT NULL,
                 applied_at TIMESTAMPTZ DEFAULT NULL
             )
+        """)
+        await conn.execute("""
+            ALTER TABLE memory_rebuild_plans
+            ADD COLUMN IF NOT EXISTS apply_result JSONB
         """)
 
 
@@ -289,7 +294,7 @@ def _validate_actions(source_ids, actions):
             target_layer = 2
         elif action == "MERGE":
             target_layer = 3
-        elif target_layer not in {2, 3}:
+        elif target_layer not in {1, 2, 3}:
             target_layer = 3
         normalized.append({
             "action": action,
@@ -533,7 +538,7 @@ async def get_memory_rebuild_status():
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT id, summary
+            """SELECT id, status, summary
                FROM memory_rebuild_plans
                ORDER BY id DESC
                LIMIT 1"""
@@ -544,7 +549,7 @@ async def get_memory_rebuild_status():
     summary = _jsonb_object(row["summary"])
     source_count = int(summary.get("source_count") or 0)
     result.update({
-        "phase": "done",
+        "phase": "applied" if row["status"] == "applied" else "done",
         "processed": source_count,
         "total": source_count,
         "plan_id": int(row["id"]),
@@ -558,7 +563,8 @@ async def get_memory_rebuild_plan(plan_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """SELECT id, created_at, status, source_count, summary, plan, applied_at
+            """SELECT id, created_at, status, source_count, summary, plan,
+                      applied_at, apply_result
                FROM memory_rebuild_plans WHERE id = $1""",
             int(plan_id),
         )
@@ -572,4 +578,138 @@ async def get_memory_rebuild_plan(plan_id: int):
         "summary": _jsonb_object(row["summary"]),
         "plan": _jsonb_object(row["plan"]),
         "applied_at": row["applied_at"].isoformat() if row["applied_at"] else None,
+        "apply_result": _jsonb_object(row["apply_result"]) if row["apply_result"] else None,
     }
+
+
+def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int) -> dict:
+    """Validate the complete saved plan against the locked active snapshot."""
+    if plan.get("version") != 1:
+        raise ValueError("不支持的重整方案版本")
+    source_hashes = plan.get("source_hashes")
+    if not isinstance(source_hashes, dict) or len(source_hashes) != source_count:
+        raise ValueError("方案来源数量不一致")
+    try:
+        expected_ids = {int(value) for value in source_hashes}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("方案来源 ID 无效") from exc
+    if len(expected_ids) != len(source_hashes):
+        raise ValueError("方案来源 ID 重复")
+    source_map = {int(item["id"]): item for item in active_sources}
+    if set(source_map) != expected_ids:
+        raise RebuildApplyConflict("活跃记忆集合已变化，请重新生成并审阅方案")
+    for source_id, source in source_map.items():
+        if _content_hash(source["content"]) != source_hashes[str(source_id)]:
+            raise RebuildApplyConflict(
+                f"来源记忆 #{source_id} 已变化，请重新生成并审阅方案"
+            )
+
+    actions = _validate_actions(expected_ids, plan.get("actions") or [])
+    archive_ids = []
+    kept_ids = []
+    creates = []
+    for action in actions:
+        ids = action["source_ids"]
+        if action["action"] == "DISCARD":
+            archive_ids.extend(ids)
+            continue
+        if action["action"] == "KEEP":
+            source = source_map[ids[0]]
+            if (source["content"] == action["content"]
+                    and int(source["layer"] or 1) == action["target_layer"]
+                    and (source["title"] or "") == action["title"]
+                    and int(source["importance"] or 5) == action["importance"]):
+                kept_ids.append(ids[0])
+                continue
+        archive_ids.extend(ids)
+        dates = []
+        for source_id in ids:
+            source = source_map[source_id]
+            date_value = source["event_date"] or source["created_at"]
+            if date_value is not None:
+                dates.append(date_value.date() if hasattr(date_value, "date") else date_value)
+        creates.append({
+            "content": action["content"],
+            "importance": action["importance"],
+            "layer": action["target_layer"],
+            "title": action["title"],
+            "merged_from": ids,
+            "event_date": min(dates) if dates else None,
+        })
+    return {
+        "archive_ids": sorted(archive_ids),
+        "kept_ids": sorted(kept_ids),
+        "creates": creates,
+    }
+
+
+async def apply_memory_rebuild_plan(plan_id: int, confirmed_plan_id: int) -> dict:
+    """Apply one reviewed plan atomically; fail closed on any concurrent change."""
+    if plan_id != confirmed_plan_id:
+        raise ValueError("确认的方案编号不匹配")
+    await ensure_rebuild_table()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """SELECT id, status, source_count, plan
+                   FROM memory_rebuild_plans WHERE id = $1 FOR UPDATE""",
+                plan_id,
+            )
+            if not row:
+                raise ValueError("重整方案不存在")
+            if row["status"] != "preview":
+                raise RebuildApplyConflict("这份方案已应用或不再可应用")
+
+            # Exclude concurrent INSERT/UPDATE while comparing the saved snapshot.
+            await conn.execute("LOCK TABLE memories IN SHARE ROW EXCLUSIVE MODE")
+            active_rows = await conn.fetch(
+                """SELECT id, content, importance, layer, title,
+                          event_date, created_at
+                   FROM memories WHERE is_active = TRUE ORDER BY id"""
+            )
+            prepared = _prepare_rebuild_apply(
+                _jsonb_object(row["plan"]), active_rows, int(row["source_count"])
+            )
+            archive_ids = prepared["archive_ids"]
+            if archive_ids:
+                command = await conn.execute(
+                    """UPDATE memories SET is_active = FALSE
+                       WHERE id = ANY($1::int[]) AND is_active = TRUE""",
+                    archive_ids,
+                )
+                if int(command.split()[-1]) != len(archive_ids):
+                    raise RebuildApplyConflict("归档数量不一致，整批操作已回滚")
+
+            created_ids = []
+            for item in prepared["creates"]:
+                new_id = await conn.fetchval(
+                    """INSERT INTO memories
+                       (content, importance, layer, title, is_active,
+                        merged_from, event_date)
+                       VALUES ($1, $2, $3, $4, TRUE, $5, $6)
+                       RETURNING id""",
+                    item["content"], item["importance"], item["layer"],
+                    item["title"], item["merged_from"], item["event_date"],
+                )
+                if new_id is None:
+                    raise RuntimeError("创建整理记忆失败，整批操作已回滚")
+                created_ids.append(int(new_id))
+
+            result = {
+                "status": "applied",
+                "plan_id": plan_id,
+                "archived": len(archive_ids),
+                "kept": len(prepared["kept_ids"]),
+                "created": len(created_ids),
+                "created_ids": created_ids,
+            }
+            await conn.execute(
+                """UPDATE memory_rebuild_plans
+                   SET status = 'applied', applied_at = NOW(),
+                       apply_result = $2::jsonb WHERE id = $1""",
+                plan_id, _json_text(result),
+            )
+    if _status.get("plan_id") == plan_id:
+        _status["phase"] = "applied"
+    return result

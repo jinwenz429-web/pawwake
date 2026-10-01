@@ -834,9 +834,10 @@ async function doConsolidate() {
 }
 
 // ============================================
-// 整库重整 Dry Run
+// 整库重整：Dry Run 与人工确认 Apply
 // ============================================
 let rebuildPollTimer = null;
+let rebuildActivePlan = null;
 
 async function rebuildFetchJson(url, options = undefined) {
     const resp = await fetch(url, options);
@@ -868,6 +869,8 @@ async function startMemoryRebuild() {
     document.getElementById('rebuildStatus').textContent = '正在启动整库重整...';
     document.getElementById('rebuildSummary').style.display = 'none';
     document.getElementById('rebuildPlanPreview').innerHTML = '';
+    document.getElementById('applyRebuildBtn').style.display = 'none';
+    rebuildActivePlan = null;
     try {
         const data = await rebuildFetchJson('/api/memories/rebuild/preview', {
             method: 'POST',
@@ -915,7 +918,9 @@ async function refreshMemoryRebuildStatus() {
             return;
         }
         if (status.plan_id) {
-            statusEl.textContent = '✅ Dry Run 已完成，方案 #' + status.plan_id;
+            statusEl.textContent = status.phase === 'applied'
+                ? '✅ 方案 #' + status.plan_id + ' 已应用'
+                : '✅ Dry Run 已完成，方案 #' + status.plan_id;
             await loadMemoryRebuildPlan(status.plan_id);
         } else {
             statusEl.textContent = '尚未运行';
@@ -928,6 +933,7 @@ async function refreshMemoryRebuildStatus() {
 async function loadMemoryRebuildPlan(planId) {
     const data = await rebuildFetchJson('/api/memories/rebuild/plan/' + planId);
     if (data.error) throw new Error(data.error);
+    rebuildActivePlan = data;
 
     const summary = data.summary || {};
     const summaryEl = document.getElementById('rebuildSummary');
@@ -935,10 +941,15 @@ async function loadMemoryRebuildPlan(planId) {
     summaryEl.innerHTML =
         '<strong>方案 #' + data.id + '</strong><br>' +
         '来源 ' + (summary.source_count || 0) + ' 条 → 预计活跃 ' +
-        (summary.estimated_active_after || 0) + ' 条；归档 ' +
+        (summary.estimated_active_after || 0) + ' 条；建议丢弃 ' +
         (summary.discarded_sources || 0) + ' 条；合并动作 ' +
         (summary.merge_actions || 0) + '；事件动作 ' +
-        (summary.event_actions || 0) + '。';
+        (summary.event_actions || 0) + '。' +
+        (data.status === 'applied' && data.apply_result
+            ? '<br><strong>已应用：</strong>实际归档 ' + data.apply_result.archived +
+              ' 条，新增 ' + data.apply_result.created + ' 条，原样保留 ' +
+              data.apply_result.kept + ' 条。'
+            : '');
 
     const sourceMap = new Map((allMemories || []).map(m => [m.id, m]));
     const actions = (data.plan && data.plan.actions) || [];
@@ -962,6 +973,40 @@ async function loadMemoryRebuildPlan(planId) {
     }).join('');
     document.getElementById('rebuildPlanPreview').innerHTML = html ||
         '<div class="hint">方案中没有动作。</div>';
+    document.getElementById('applyRebuildBtn').style.display =
+        data.status === 'preview' ? '' : 'none';
+}
+
+async function applyMemoryRebuild() {
+    const plan = rebuildActivePlan;
+    if (!plan || plan.status !== 'preview') return;
+    const summary = plan.summary || {};
+    const entered = prompt('即将应用方案 #' + plan.id + '。请先审阅上方动作，然后输入方案编号确认：');
+    if (entered !== String(plan.id)) return;
+    const applyKey = prompt('请输入 Render Environment 中的 MEMORY_REBUILD_APPLY_TOKEN。密钥仅用于本次请求，不会保存在浏览器。');
+    if (!applyKey) return;
+    if (!confirm('确认应用方案 #' + plan.id + '？\n来源 ' +
+        (summary.source_count || 0) + ' 条，建议丢弃 ' +
+        (summary.discarded_sources || 0) + ' 条。合并或替换的来源也会软归档，原记忆不会永久删除。')) return;
+
+    const button = document.getElementById('applyRebuildBtn');
+    const statusEl = document.getElementById('rebuildStatus');
+    button.disabled = true;
+    statusEl.textContent = '⏳ 正在校验并应用方案 #' + plan.id + '...';
+    try {
+        const result = await rebuildFetchJson('/api/memories/rebuild/plan/' + plan.id + '/apply', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-Memory-Rebuild-Apply-Key': applyKey},
+            body: JSON.stringify({confirmed_plan_id: plan.id})
+        });
+        statusEl.textContent = '✅ 方案 #' + plan.id + ' 已应用：归档 ' +
+            result.archived + ' 条，新增 ' + result.created + ' 条。';
+        await loadMemoryRebuildPlan(plan.id);
+    } catch (e) {
+        statusEl.textContent = '❌ 应用失败：' + e.message;
+    } finally {
+        button.disabled = false;
+    }
 }
 
 // ============================================

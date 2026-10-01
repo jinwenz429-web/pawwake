@@ -79,6 +79,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `GATEWAY_SECRET`（强烈建议） | 程序 API 鉴权密钥，客户端通过 `X-Gateway-Key` 请求头发送 | 独立随机值 |
 | `DASHBOARD_PASSWORD` | Dashboard 登录密码，不与网关密钥共用 | 独立强密码 |
 | `SESSION_SECRET` | Dashboard 会话签名密钥，至少 32 字符且每次部署保持不变 | 独立随机值 |
+| `MEMORY_REBUILD_APPLY_TOKEN` | 整库重整 Apply 的独立密钥，至少 32 字符；不配置时 Apply 接口关闭 | 独立随机值 |
 
 5. 部署，访问你的网关地址看到 `{"status":"running"}` 就成功了
 

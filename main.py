@@ -47,6 +47,8 @@ from memory_rebuilder import (
     start_memory_rebuild_preview,
     get_memory_rebuild_status,
     get_memory_rebuild_plan,
+    apply_memory_rebuild_plan,
+    RebuildApplyConflict,
 )
 from diary_store import ensure_dylan_diary_table, save_dylan_diary
 
@@ -2428,7 +2430,7 @@ async def api_batch_restore(request: Request):
 
 
 # ============================================================
-# 整库重整（只生成可审阅 dry-run plan，不直接改记忆）
+# 整库重整：先审阅持久化方案，再显式确认应用
 # ============================================================
 
 @app.post("/api/memories/rebuild/preview")
@@ -2450,6 +2452,28 @@ async def api_memory_rebuild_plan(plan_id: int):
     if not plan:
         return JSONResponse(status_code=404, content={"error": "重整方案不存在"})
     return plan
+
+
+@app.post("/api/memories/rebuild/plan/{plan_id}/apply")
+async def api_memory_rebuild_apply(plan_id: int, request: Request):
+    """应用已审阅方案；数据库负责来源校验与整批回滚。"""
+    apply_token = os.getenv("MEMORY_REBUILD_APPLY_TOKEN", "")
+    if len(apply_token) < 32:
+        return JSONResponse(status_code=503, content={"error": "尚未配置安全 Apply 密钥"})
+    provided_token = request.headers.get("X-Memory-Rebuild-Apply-Key", "")
+    if not secrets.compare_digest(provided_token, apply_token):
+        return JSONResponse(status_code=403, content={"error": "Apply 密钥不正确"})
+    try:
+        body = await request.json()
+        confirmed_plan_id = int(body.get("confirmed_plan_id"))
+    except (ValueError, TypeError, AttributeError):
+        return JSONResponse(status_code=400, content={"error": "请确认方案编号"})
+    try:
+        return await apply_memory_rebuild_plan(plan_id, confirmed_plan_id)
+    except RebuildApplyConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
 # ============================================================
