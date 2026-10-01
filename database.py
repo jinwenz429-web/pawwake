@@ -137,6 +137,10 @@ async def init_tables():
             )
         """)
         await conn.execute("""
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS is_superseded BOOLEAN NOT NULL DEFAULT FALSE
+        """)
+        await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memory_message_sources_message
             ON memory_message_sources (message_id)
         """)
@@ -718,6 +722,7 @@ async def replace_last_conversation_round(
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", _MEMORY_DEDUP_LOCK_KEY)
             user = await conn.fetchrow(
                 """SELECT id, content FROM conversations
                    WHERE session_id = $1 AND role = 'user'
@@ -774,6 +779,13 @@ async def archive_replaced_answer_memories(
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", _MEMORY_DEDUP_LOCK_KEY)
+            await conn.execute(
+                """UPDATE conversations SET is_superseded = TRUE
+                   WHERE session_id = $1 AND role = 'assistant'
+                     AND id > $2 AND id <= $3""",
+                session_id, user_id, assistant_id,
+            )
             await conn.execute(
                 """UPDATE memories SET is_active = FALSE
                    WHERE id IN (
@@ -798,6 +810,7 @@ async def delete_assistant_rounds(session_id: str, round_ids: list) -> bool:
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", _MEMORY_DEDUP_LOCK_KEY)
             for user_id, assistant_id in round_ids:
                 if not isinstance(user_id, int) or not isinstance(assistant_id, int) or user_id >= assistant_id:
                     return False
@@ -1496,6 +1509,9 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
     pool = await get_pool()
     embedding_refresh_id = None
     result = None
+    source_ids = sorted({value for value in (source_message_ids or [])
+                         if isinstance(value, int) and not isinstance(value, bool)
+                         and value > 0})
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -1503,6 +1519,18 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                 "SELECT pg_advisory_xact_lock($1)",
                 _MEMORY_DEDUP_LOCK_KEY,
             )
+            if source_message_ids is not None:
+                valid_source_count = await conn.fetchval(
+                    """SELECT COUNT(*) FROM conversations
+                       WHERE session_id = $1 AND id = ANY($2::int[])
+                         AND is_superseded = FALSE""",
+                    source_session, source_ids,
+                )
+                if not source_ids or valid_source_count != len(source_ids):
+                    return {
+                        "action": "skipped", "reason": "invalid_source",
+                        "memory_id": None, "matched_id": None, "similarity": None,
+                    }
             if new_keywords:
                 where_parts = [
                     f"content ILIKE '%' || ${index + 1} || '%'"
@@ -1593,9 +1621,6 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                     "similarity": None,
                 }
 
-            source_ids = sorted({value for value in (source_message_ids or [])
-                                 if isinstance(value, int) and not isinstance(value, bool)
-                                 and value > 0})
             if result["action"] in ("inserted", "updated") and result["memory_id"] and source_ids:
                 await conn.execute(
                     """INSERT INTO memory_message_sources (memory_id, message_id)

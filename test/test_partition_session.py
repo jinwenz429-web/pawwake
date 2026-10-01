@@ -378,6 +378,42 @@ class PartitionRerollTests(unittest.TestCase):
 
 
 class DeletedAssistantTests(unittest.TestCase):
+    def test_late_extraction_cannot_save_memory_from_a_replaced_reply(self):
+        class Connection:
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def execute(self, *args):
+                return None
+
+            async def fetchval(self, query, session_id, source_ids):
+                self.checked_ids = source_ids
+                return 0
+
+            async def fetch(self, *args):
+                raise AssertionError("invalid source reached memory search")
+
+        class Pool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return _AcquireConnection(self.connection)
+
+        connection = Connection()
+        with patch.object(database, "get_pool", return_value=Pool(connection)):
+            result = asyncio.run(database.save_memory_deduplicated(
+                "Obsolete reply", source_session="s", source_message_ids=[2],
+            ))
+        self.assertEqual(connection.checked_ids, [2])
+        self.assertEqual(result["reason"], "invalid_source")
+
     def test_deletion_archives_linked_memories_before_removing_reply(self):
         class Connection:
             def __init__(self):
