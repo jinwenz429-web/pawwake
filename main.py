@@ -993,6 +993,7 @@ async def build_partitioned_messages(
     base_prompt: str,
     user_message: str,
     conversation_recall_text: str = "",
+    active_tool_call_ids: set | None = None,
 ) -> list:
     """
     分区缓存模式：构建带breakpoint的messages数组。
@@ -1036,6 +1037,18 @@ async def build_partitioned_messages(
     # 按逻辑轮分组（解决tool消息导致的轮计数错乱）
     rounds = group_by_rounds(history)
     total_rounds = len(rounds)
+    active_tool_round = None
+    if active_tool_call_ids:
+        for index, round_messages in enumerate(rounds):
+            if any(
+                msg.get("role") == "assistant"
+                and any(
+                    call.get("id") in active_tool_call_ids
+                    for call in msg.get("tool_calls", [])
+                )
+                for msg in round_messages
+            ):
+                active_tool_round = index
     
     state = await get_session_cache_state(session_id)
     summary_parts = state['summary_parts']
@@ -1062,6 +1075,8 @@ async def build_partitioned_messages(
     rotation_count = 0
     max_rotations = CACHE_MAX_ROTATIONS if CACHE_PARTITION_TRIGGER == "time" else 999
     while _should_rotate(b_rounds_count, X, a_msgs) and rotation_count < max_rotations:
+        if active_tool_round is not None and a_start_round <= active_tool_round < a_end_round:
+            break
         rotation_count += 1
         trigger_info = f"B区{b_rounds_count}轮 >= X={X}" if CACHE_PARTITION_TRIGGER != "time" else f"A区首条消息超出{CACHE_PARTITION_WINDOW}分钟窗口"
         print(
@@ -1086,6 +1101,15 @@ async def build_partitioned_messages(
         a_end_round = a_start_round + X
         a_round_groups = rounds[a_start_round : a_end_round]
         b_round_groups = rounds[a_end_round :]
+        a_msgs = [msg for rnd in a_round_groups for msg in rnd]
+        b_msgs = [msg for rnd in b_round_groups for msg in rnd]
+        b_rounds_count = len(b_round_groups)
+
+    if active_tool_round is not None and a_start_round <= active_tool_round < a_end_round:
+        # A区会剥离工具消息；当前刚完成的工具轮次必须整体留在B区。
+        a_end_round = active_tool_round
+        a_round_groups = rounds[a_start_round:a_end_round]
+        b_round_groups = rounds[a_end_round:]
         a_msgs = [msg for rnd in a_round_groups for msg in rnd]
         b_msgs = [msg for rnd in b_round_groups for msg in rnd]
         b_rounds_count = len(b_round_groups)
@@ -1403,6 +1427,9 @@ async def process_memories_background(
                     meta_dict["name"] = tm["name"]
                 meta = json.dumps(meta_dict) if meta_dict else None
                 await save_message(session_id, "tool", tm.get("content", ""), model, metadata=meta)
+
+            if user_msg and context_messages and context_messages[-1].get("role") == "user":
+                await save_message(session_id, "user", user_msg, model)
             
             if assistant_msg or assistant_tool_calls:
                 ast_meta_dict = {}
@@ -1713,11 +1740,11 @@ async def _chat_completions_inner(request: Request):
             print(f"🔧 去重: 过滤{len(user_msgs)-len(tail_user_ids)}条冗余user，保留末尾连续{len(tail_user_ids)}条")
         # 工具结果轮次处理：基于DB状态 + 当前轮次tool_call_id精确判断
         client_tools = [m for m in client_new_msgs if m.get("role") == "tool"]
-        if client_tools:
+        active_tool_call_ids = set()
+        db_last = db_msgs[-1] if db_msgs else None
+        db_expecting_tool = (db_last and db_last.get("role") == "assistant" and db_last.get("tool_calls"))
+        if client_tools or db_expecting_tool:
             # 判断DB是否处于"等待tool结果"状态（最后一条是assistant(tool_calls)）
-            db_last = db_msgs[-1] if db_msgs else None
-            db_expecting_tool = (db_last and db_last.get("role") == "assistant" and db_last.get("tool_calls"))
-            
             if not db_expecting_tool:
                 # DB不在等待tool结果 → 客户端的所有tool都是历史残留（含手动删除后的幽灵）
                 stale_ids = [m.get('tool_call_id', '?') for m in client_tools]
@@ -1734,6 +1761,43 @@ async def _chat_completions_inner(request: Request):
                     print(f"🔧 去重: 丢弃{len(stale_tools)}条非当前轮次tool (ids: {[m.get('tool_call_id','?') for m in stale_tools]})")
                 if new_tools:
                     print(f"🔧 保留{len(new_tools)}条当前轮次tool (ids: {[m.get('tool_call_id','?') for m in new_tools]})")
+
+                client_assistant = next(
+                    (m for m in reversed(messages) if m.get("role") == "assistant" and m.get("tool_calls")),
+                    None,
+                )
+                client_call_ids = {
+                    tc.get("id") for tc in client_assistant.get("tool_calls", []) if tc.get("id")
+                } if client_assistant else set()
+                expected_ids = [tc.get("id") for tc in expected_tool_calls if tc.get("id")]
+                new_tool_ids = {m.get("tool_call_id") for m in new_tools}
+                client_trimmed_turn = (
+                    client_call_ids
+                    and client_call_ids < set(expected_ids)
+                    and client_call_ids <= new_tool_ids
+                )
+                if missing_tool_ids and not duplicate_tool_ids and (tail_user_ids or client_trimmed_turn):
+                    missing_set = set(missing_tool_ids)
+                    for tool_call in expected_tool_calls:
+                        tool_call_id = tool_call.get("id")
+                        if tool_call_id not in missing_set:
+                            continue
+                        tool_name = tool_call.get("function", {}).get("name", "")
+                        new_tools.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": tool_name,
+                            "content": json.dumps({
+                                "error": "client_omitted_tool_result",
+                                "status": "unknown",
+                                "retryable": False,
+                                "message": "The client did not return this tool result. Do not assume the operation succeeded or retry side-effecting operations without user confirmation.",
+                            }),
+                        })
+                    result_by_id = {m["tool_call_id"]: m for m in new_tools}
+                    new_tools = [result_by_id[tool_call_id] for tool_call_id in expected_ids]
+                    missing_tool_ids = []
+                    print("🔧 已用状态未知的错误结果闭合客户端放弃的工具轮次")
 
                 if missing_tool_ids or duplicate_tool_ids:
                     expected_count = len([tc for tc in expected_tool_calls if tc.get("id")])
@@ -1758,6 +1822,9 @@ async def _chat_completions_inner(request: Request):
                         },
                     )
                 
+                if new_tools:
+                    active_tool_call_ids = set(expected_ids)
+
                 # 重建 client_new_msgs（user此时已只剩末尾连续块，全部保回，别把拆条发送的图丢了）
                 tail_users = [m for m in client_new_msgs if m.get("role") == "user"]
                 client_new_msgs = new_tools[:] + tail_users
@@ -1808,6 +1875,7 @@ async def _chat_completions_inner(request: Request):
                 partition_prompt,
                 user_message,
                 conversation_recall_text,
+                active_tool_call_ids=active_tool_call_ids,
             )
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
