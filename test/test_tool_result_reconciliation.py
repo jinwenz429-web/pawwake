@@ -78,9 +78,16 @@ class ToolResultReconciliationTests(unittest.TestCase):
     def setUp(self):
         _RecordingAsyncClient.posted_bodies = []
 
-    def _run_request(self, tool_messages, tool_calls=None, real_partition=False):
+    def _run_request(self, tool_messages, tool_calls=None, real_partition=False, prior_rounds=0,
+                     force_time_rotation=False):
         async def fake_get_conversation_messages(session_id, limit=10000):
-            return _db_history(tool_calls)
+            history = []
+            for index in range(prior_rounds):
+                history.extend([
+                    {"role": "user", "content": f"earlier question {index}", "metadata": None, "created_at": None},
+                    {"role": "assistant", "content": f"earlier answer {index}", "metadata": None, "created_at": None},
+                ])
+            return history + _db_history(tool_calls)
 
         async def fake_get_session_cache_state(session_id):
             return {"summary_parts": [], "a_start_round": 0}
@@ -112,6 +119,12 @@ class ToolResultReconciliationTests(unittest.TestCase):
             if real_partition:
                 stack.enter_context(patch.object(main, "CACHE_PARTITION_X", 15))
                 stack.enter_context(patch.object(main, "get_session_cache_state", fake_get_session_cache_state))
+                if force_time_rotation:
+                    stack.enter_context(patch.object(main, "CACHE_PARTITION_TRIGGER", "time"))
+                    stack.enter_context(patch.object(main, "CACHE_MAX_ROTATIONS", 1))
+                    stack.enter_context(patch.object(main, "_should_rotate", return_value=True))
+                    stack.enter_context(patch.object(main, "generate_summary", unittest.mock.AsyncMock(return_value="summary")))
+                    stack.enter_context(patch.object(main, "save_session_cache_state", unittest.mock.AsyncMock()))
             else:
                 stack.enter_context(patch.object(main, "build_partitioned_messages", _identity_partition_messages))
             stack.enter_context(patch.object(main, "conversation_persistence_enabled", return_value=False))
@@ -211,6 +224,92 @@ class ToolResultReconciliationTests(unittest.TestCase):
         battery_result = next(m for m in forwarded if m.get("tool_call_id") == "call_b")
         self.assertEqual(battery_result["name"], "get_battery")
         self.assertEqual(json.loads(battery_result["content"])["status"], "unknown")
+
+    def test_recovered_tool_turn_survives_partition_a_boundary(self):
+        response = self._run_request(
+            [
+                {"role": "assistant", "content": "", "tool_calls": [_tool_call("call_a")]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "result-a"},
+            ],
+            tool_calls=[_tool_call("call_a"), _tool_call("call_b")],
+            real_partition=True,
+            prior_rounds=14,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = _RecordingAsyncClient.posted_bodies[0]["messages"]
+        self.assertEqual(
+            [call["id"] for message in forwarded for call in message.get("tool_calls", [])],
+            ["call_a", "call_b"],
+        )
+        self.assertEqual(
+            [message["tool_call_id"] for message in forwarded if message.get("role") == "tool"],
+            ["call_a", "call_b"],
+        )
+        missing_result = next(message for message in forwarded if message.get("tool_call_id") == "call_b")
+        self.assertEqual(json.loads(missing_result["content"])["status"], "unknown")
+
+    def test_recovered_tool_turn_precedes_new_user_at_partition_a_boundary(self):
+        response = self._run_request(
+            [
+                {"role": "tool", "tool_call_id": "call_a", "content": "result-a"},
+                {"role": "user", "content": "continue after the error"},
+            ],
+            tool_calls=[_tool_call("call_a"), _tool_call("call_b")],
+            real_partition=True,
+            prior_rounds=14,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = _RecordingAsyncClient.posted_bodies[0]["messages"]
+        self.assertEqual(
+            [(message["role"], message.get("tool_call_id")) for message in forwarded[-4:]],
+            [("assistant", None), ("tool", "call_a"), ("tool", "call_b"), ("user", None)],
+        )
+        self.assertEqual(
+            [call["id"] for call in forwarded[-4]["tool_calls"]],
+            ["call_a", "call_b"],
+        )
+
+    def test_recovered_tool_turn_is_not_rotated_into_summary(self):
+        response = self._run_request(
+            [
+                {"role": "assistant", "content": "", "tool_calls": [_tool_call("call_a")]},
+                {"role": "tool", "tool_call_id": "call_a", "content": "result-a"},
+            ],
+            tool_calls=[_tool_call("call_a"), _tool_call("call_b")],
+            real_partition=True,
+            prior_rounds=14,
+            force_time_rotation=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = _RecordingAsyncClient.posted_bodies[0]["messages"]
+        self.assertEqual(
+            [message["tool_call_id"] for message in forwarded if message.get("role") == "tool"],
+            ["call_a", "call_b"],
+        )
+
+    def test_matching_error_result_survives_partition_a_boundary(self):
+        error_content = json.dumps({"error": "get_battery timed out"})
+        response = self._run_request(
+            [
+                {"role": "tool", "tool_call_id": "call_a", "content": "result-a"},
+                {"role": "tool", "tool_call_id": "call_b", "content": error_content},
+            ],
+            tool_calls=[_tool_call("call_a"), _tool_call("call_b")],
+            real_partition=True,
+            prior_rounds=14,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = _RecordingAsyncClient.posted_bodies[0]["messages"]
+        self.assertEqual(
+            [message["tool_call_id"] for message in forwarded if message.get("role") == "tool"],
+            ["call_a", "call_b"],
+        )
+        error_result = next(message for message in forwarded if message.get("tool_call_id") == "call_b")
+        self.assertEqual(error_result["content"], error_content)
 
     def test_new_user_closes_pending_turn_before_user_message(self):
         response = self._run_request(
