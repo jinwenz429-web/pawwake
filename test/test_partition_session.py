@@ -238,6 +238,8 @@ class PartitionRerollTests(unittest.TestCase):
             stack.enter_context(patch.object(main, "FORCE_STREAM", False))
             stack.enter_context(patch.object(main, "get_system_prompt", lambda: asyncio.sleep(0, result="")))
             stack.enter_context(patch.object(main, "get_conversation_messages", fake_history))
+            stack.enter_context(patch.object(main, "delete_auxiliary_suggestion_messages", lambda *a: asyncio.sleep(0, result=True)))
+            stack.enter_context(patch.object(main, "delete_redundant_reroll_tail", lambda *a: asyncio.sleep(0, result=True)))
             stack.enter_context(patch.object(main, "delete_assistant_rounds", lambda *a: asyncio.sleep(0, result=True)))
             stack.enter_context(patch.object(main, "archive_replaced_answer_memories", lambda *a: asyncio.sleep(0)))
             stack.enter_context(patch.object(main, "get_session_cache_state", fake_cache_state))
@@ -264,6 +266,74 @@ class PartitionRerollTests(unittest.TestCase):
         self.assertFalse(any(m.get("content") == "ROLLED_AWAY_REPLY" for m in reroll))
         self.assertEqual(sum("echo" in str(m.get("content", "")) for m in repeat), 2)
         self.assertTrue(any(m.get("content") == "ROLLED_AWAY_REPLY" for m in repeat))
+
+    def test_prior_failed_rerolls_are_removed_only_with_client_history_evidence(self):
+        db = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "earlier reply"},
+            {"role": "user", "content": "echo"},
+            {"role": "assistant", "content": "OLD_REPLY_1"},
+            {"role": "user", "content": "echo"},
+            {"role": "assistant", "content": "OLD_REPLY_2"},
+            {"role": "user", "content": "echo"},
+            {"role": "assistant", "content": "OLD_REPLY_3"},
+        ]
+        client = db[:2] + [{"role": "user", "content": "echo"}]
+        self.assertEqual(main.find_partition_reroll_start(db, client), 2)
+        sent = self._sent_messages(db, client)
+        serialized = json.dumps(sent)
+        self.assertNotIn("OLD_REPLY", serialized)
+        self.assertEqual(sum("echo" in str(m.get("content", "")) for m in sent), 1)
+
+    def test_redundant_tail_cleanup_checks_users_and_archives_before_delete(self):
+        class Connection:
+            def __init__(self, conflicting):
+                self.queries = []
+                self.conflicting = conflicting
+
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def execute(self, query, *args):
+                self.queries.append(query)
+
+            async def fetchrow(self, query, *args):
+                if "ORDER BY id DESC" in query:
+                    return {"id": 8, "role": "assistant"}
+                return {"role": "user", "content": "echo"}
+
+            async def fetchval(self, *args):
+                return self.conflicting
+
+        class Pool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return _AcquireConnection(self.connection)
+
+        conflict = Connection(True)
+        with patch.object(database, "get_pool", return_value=Pool(conflict)):
+            result = asyncio.run(database.delete_redundant_reroll_tail(
+                "same-session", 5, 8, "echo",
+            ))
+        self.assertFalse(result)
+        self.assertFalse(any("DELETE FROM conversations" in query for query in conflict.queries))
+
+        clean = Connection(False)
+        with patch.object(database, "get_pool", return_value=Pool(clean)):
+            self.assertTrue(asyncio.run(database.delete_redundant_reroll_tail(
+                "same-session", 5, 8, "echo",
+            )))
+        archive = next(i for i, query in enumerate(clean.queries) if "UPDATE memories" in query)
+        delete = next(i for i, query in enumerate(clean.queries) if "DELETE FROM conversations" in query)
+        self.assertLess(archive, delete)
 
     def test_request_history_distinguishes_reroll_from_intentional_repeat(self):
         db = [
@@ -375,6 +445,100 @@ class PartitionRerollTests(unittest.TestCase):
                    if "DELETE FROM conversations" in query]
         self.assertEqual(len(deletes), 1)
         self.assertEqual(deletes[0][1], ("same-session", 10, 13))
+
+
+class AuxiliarySuggestionTests(unittest.TestCase):
+    suggestion_prompt = (
+        "Suggest up to 3 useful next messages for the user, based on the conversation below.\n"
+        'Output only JSON: {"suggestions":["candidate user message"]}.'
+    )
+
+    def test_suggestion_call_bypasses_partition_and_persistence(self):
+        client = _CapturingAsyncClient()
+        messages = [
+            {"role": "system", "content": "Generate candidate next messages that the USER can send to the assistant. Return JSON with \"suggestions\"."},
+            {"role": "user", "content": self.suggestion_prompt},
+        ]
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(main, "CACHE_PARTITION_ENABLED", True))
+            stack.enter_context(patch.object(main, "MEMORY_ENABLED", True))
+            stack.enter_context(patch.object(main, "FORCE_STREAM", False))
+            stack.enter_context(patch.object(main, "conversation_persistence_enabled", lambda: False))
+            stack.enter_context(patch.object(main, "get_conversation_messages", side_effect=AssertionError("suggestions read chat history")))
+            stack.enter_context(patch.object(main.httpx, "AsyncClient", lambda *a, **kw: client))
+            response = asyncio.run(main._chat_completions_inner(_FakeRequest(
+                {"messages": messages, "model": "suggestion-model", "stream": False},
+                {"X-Conversation-Id": "same-session"},
+            )))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(client.sent_body["messages"], messages)
+
+    def test_stored_suggestions_are_removed_before_reroll_detection(self):
+        db = [
+            {"role": "user", "content": "earlier"},
+            {"role": "assistant", "content": "earlier reply"},
+            {"role": "user", "content": "echo"},
+            {"role": "assistant", "content": "ROLLED_AWAY_REPLY"},
+            {"role": "user", "content": self.suggestion_prompt},
+            {"role": "assistant", "content": '{"suggestions":["try this"]}'},
+        ]
+        client = db[:2] + [{"role": "user", "content": "echo"}]
+        sent = PartitionRerollTests()._sent_messages(db, client)
+        serialized = json.dumps(sent)
+        self.assertNotIn("ROLLED_AWAY_REPLY", serialized)
+        self.assertNotIn("Suggest up to 3", serialized)
+        self.assertNotIn("try this", serialized)
+
+    def test_skipped_auxiliary_request_does_not_extract_memory(self):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(main, "MEMORY_ENABLED", True))
+            stack.enter_context(patch.object(main, "save_message", side_effect=AssertionError("auxiliary request saved")))
+            stack.enter_context(patch.object(main, "extract_memories", side_effect=AssertionError("auxiliary request extracted")))
+            asyncio.run(main.process_memories_background(
+                "same-session", self.suggestion_prompt, "suggestions", "suggestion-model",
+                skip_conversation_log=True,
+            ))
+
+    def test_cleanup_archives_linked_memories_before_removing_suggestions(self):
+        class Connection:
+            def __init__(self, prompt):
+                self.prompt = prompt
+                self.queries = []
+
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def fetchrow(self, *args):
+                return {"role": "user", "content": self.prompt}
+
+            async def fetchval(self, *args):
+                return None
+
+            async def execute(self, query, *args):
+                self.queries.append(query)
+
+        class Pool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return _AcquireConnection(self.connection)
+
+        connection = Connection(self.suggestion_prompt)
+        with patch.object(database, "get_pool", return_value=Pool(connection)):
+            self.assertTrue(asyncio.run(database.delete_auxiliary_suggestion_messages(
+                "same-session", [(3, 4, self.suggestion_prompt)],
+            )))
+        archive = next(i for i, query in enumerate(connection.queries) if "UPDATE memories" in query)
+        delete = next(i for i, query in enumerate(connection.queries) if "DELETE FROM conversations" in query)
+        self.assertLess(archive, delete)
+        self.assertIn("memory_message_sources", connection.queries[archive])
 
 
 class DeletedAssistantTests(unittest.TestCase):

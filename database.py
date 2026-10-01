@@ -857,6 +857,117 @@ async def delete_assistant_rounds(session_id: str, round_ids: list) -> bool:
     return True
 
 
+async def delete_auxiliary_suggestion_messages(session_id: str, ranges: list) -> bool:
+    """Remove stored Kelivo suggestion prompts and replies from a session."""
+    if not ranges:
+        return True
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", _MEMORY_DEDUP_LOCK_KEY)
+            for start_id, end_id, expected_content in ranges:
+                if not isinstance(start_id, int) or not isinstance(end_id, int) or start_id > end_id:
+                    return False
+                first = await conn.fetchrow(
+                    "SELECT role, content FROM conversations WHERE session_id = $1 AND id = $2",
+                    session_id, start_id,
+                )
+                intervening_user = await conn.fetchval(
+                    """SELECT 1 FROM conversations WHERE session_id = $1
+                       AND role = 'user' AND id > $2 AND id <= $3 LIMIT 1""",
+                    session_id, start_id, end_id,
+                )
+                if (
+                    not first or first["role"] != "user"
+                    or first["content"] != expected_content
+                    or not expected_content.startswith(
+                        "Suggest up to 3 useful next messages for the user, based on the conversation below."
+                    )
+                    or 'Output only JSON: {"suggestions":' not in expected_content
+                    or intervening_user
+                ):
+                    return False
+            for start_id, end_id, _ in ranges:
+                await conn.execute(
+                    """UPDATE memories SET is_active = FALSE WHERE id IN (
+                       SELECT DISTINCT source.memory_id
+                       FROM memory_message_sources AS source
+                       JOIN conversations AS message ON message.id = source.message_id
+                       WHERE message.session_id = $1
+                         AND message.id >= $2 AND message.id <= $3
+                   )""",
+                    session_id, start_id, end_id,
+                )
+                await conn.execute(
+                    "DELETE FROM conversations WHERE session_id = $1 AND id >= $2 AND id <= $3",
+                    session_id, start_id, end_id,
+                )
+            await conn.execute(
+                "DELETE FROM session_cache_state WHERE session_id = $1", session_id,
+            )
+    return True
+
+
+async def delete_redundant_reroll_tail(
+    session_id: str, first_duplicate_user_id: int,
+    expected_last_assistant_id: int, expected_user_content: str,
+) -> bool:
+    """Collapse only a proven tail of accidentally appended reroll attempts."""
+    if (
+        not isinstance(first_duplicate_user_id, int)
+        or not isinstance(expected_last_assistant_id, int)
+        or first_duplicate_user_id >= expected_last_assistant_id
+    ):
+        return False
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", session_id)
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", _MEMORY_DEDUP_LOCK_KEY)
+            first = await conn.fetchrow(
+                "SELECT role, content FROM conversations WHERE session_id = $1 AND id = $2",
+                session_id, first_duplicate_user_id,
+            )
+            latest = await conn.fetchrow(
+                "SELECT id, role FROM conversations WHERE session_id = $1 ORDER BY id DESC LIMIT 1",
+                session_id,
+            )
+            conflicting_user = await conn.fetchval(
+                """SELECT 1 FROM conversations WHERE session_id = $1
+                   AND role = 'user' AND id >= $2 AND id <= $3
+                   AND content IS DISTINCT FROM $4 LIMIT 1""",
+                session_id, first_duplicate_user_id, expected_last_assistant_id,
+                expected_user_content,
+            )
+            if (
+                not first or first["role"] != "user"
+                or first["content"] != expected_user_content
+                or not latest or latest["id"] != expected_last_assistant_id
+                or latest["role"] != "assistant" or conflicting_user
+            ):
+                return False
+            await conn.execute(
+                """UPDATE memories SET is_active = FALSE WHERE id IN (
+                   SELECT DISTINCT source.memory_id
+                   FROM memory_message_sources AS source
+                   JOIN conversations AS message ON message.id = source.message_id
+                   WHERE message.session_id = $1
+                     AND message.id >= $2 AND message.id <= $3
+               )""",
+                session_id, first_duplicate_user_id, expected_last_assistant_id,
+            )
+            await conn.execute(
+                """DELETE FROM conversations WHERE session_id = $1
+                   AND id >= $2 AND id <= $3""",
+                session_id, first_duplicate_user_id, expected_last_assistant_id,
+            )
+            await conn.execute(
+                "DELETE FROM session_cache_state WHERE session_id = $1", session_id,
+            )
+    return True
+
+
 async def get_last_user_content(session_id: str) -> str:
     """获取指定session最后一条user消息的content"""
     pool = await get_pool()
