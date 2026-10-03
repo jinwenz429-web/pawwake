@@ -22,6 +22,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 - **分区缓存** — 自动管理对话上下文，通过 A/B 区轮转 + 摘要压缩，利用 prompt caching 大幅节省 token 费用。兼容 tool 调用消息
 - **对话线管理** — 固定 session ID 实现跨平台对话衔接，支持多对话线切换、摘要编辑
 - **对话记录** — 浏览、搜索、批量管理历史对话，支持 session 合并
+- **失败响应处理** — 识别上游错误、内容过滤结果和空回复，失败请求不写入对话或记忆；流式错误通过标准 SSE 错误事件回传。普通助手拒绝仍作为真实回复保留
 - **Token 统计** — 自动记录每次对话的 token 消耗，按 session 汇总显示
 - **双通道鉴权** — 程序 API 只接受请求头中的 `GATEWAY_SECRET`；Dashboard 使用独立密码登录和 HttpOnly 会话 Cookie，主密钥不会进入浏览器
 - **预置记忆** — 把你想让 AI "一开始就知道"的事情批量导入

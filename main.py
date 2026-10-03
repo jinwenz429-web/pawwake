@@ -15,6 +15,7 @@ Pawwake · 爪迹 — 带记忆系统的 LLM 转发网关
 
 import os
 import json
+import re
 import uuid
 import asyncio
 import base64
@@ -1907,6 +1908,78 @@ async def chat_completions(request: Request):
         )
 
 
+def _upstream_failure(payload, final=False):
+    """识别接口失败；普通 assistant 拒绝仍是有效回复，不按关键词过滤。"""
+    blocked = {
+        "error": {
+            "message": "上游因内容限制拒绝了这次请求。若你认为属于误拦，可向 API 供应商反馈。",
+            "type": "upstream_content_filter", "code": "content_filter",
+        }
+    }
+    if isinstance(payload, dict):
+        if payload.get("error"):
+            raw_error = payload["error"]
+            error = dict(raw_error) if isinstance(raw_error, dict) else {"message": str(raw_error)}
+            error.setdefault("type", "upstream_error")
+            error.setdefault("code", "upstream_error")
+            error.setdefault("message", "上游请求失败。")
+            code = error["code"]
+            status = code if isinstance(code, int) and 400 <= code <= 599 else 502
+            if str(code).lower() == "content_filter" or str(error["type"]).lower() == "content_filter":
+                status = 400
+            return status, {"error": error}
+
+        feedback = payload.get("promptFeedback") or {}
+        if isinstance(feedback, dict) and feedback.get("blockReason") not in (None, "", "BLOCK_REASON_UNSPECIFIED"):
+            return 400, blocked
+
+        choices = payload.get("choices") or []
+        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        finish_reason = str(choice.get("finish_reason") or "").upper()
+        if finish_reason in {"CONTENT_FILTER", "SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "IMAGE_SAFETY"}:
+            return 400, blocked
+        message = choice.get("message") or choice.get("delta") or {}
+        if not isinstance(message, dict):
+            message = {}
+        content = message.get("content")
+        # 一些兼容端点把提交失败模板装进 HTTP 200 的 assistant.content。
+        # 只识别该接口模板的开头；不把一般拒绝或引用错误说明当成接口失败。
+        if isinstance(content, str):
+            prefix = re.sub(r"\s+", " ", content[:512]).strip()
+            if prefix.startswith("The prompt could not be submitted. The prompt contains sensitive words") and "Prohibited Use policy" in prefix:
+                return 400, blocked
+        if not final or content or message.get("tool_calls") or message.get("refusal"):
+            return None
+    elif not final:
+        return None
+    return 502, {"error": {
+        "message": "上游没有返回可用回复。", "type": "upstream_error",
+        "code": "upstream_empty_response",
+    }}
+
+
+def _upstream_failure_sse(failure):
+    code = failure[1]["error"].get("code")
+    safe_code = code if isinstance(code, str) and code in {
+        "content_filter", "upstream_empty_response", "upstream_incomplete_response",
+    } else "upstream_error"
+    print(f"upstream_failure stream=True code={safe_code}", flush=True)
+    return ("data: " + json.dumps(failure[1], ensure_ascii=False) + "\n\ndata: [DONE]\n\n").encode("utf-8")
+
+
+async def _upstream_sse_frames(response):
+    """按完整 SSE 帧旁路解析，保留原字节，避免 UTF-8 字符跨网络块时丢失。"""
+    buffer = b""
+    boundary = re.compile(br"\r?\n\r?\n")
+    async for chunk in response.aiter_bytes():
+        buffer += chunk
+        while match := boundary.search(buffer):
+            yield buffer[:match.end()]
+            buffer = buffer[match.end():]
+    if buffer:
+        yield buffer
+
+
 async def _chat_completions_inner(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
@@ -2340,13 +2413,23 @@ async def _chat_completions_inner(request: Request):
             response = await client.post(API_BASE_URL, headers=headers, json=body)
             
             if response.status_code == 200:
-                resp_data = response.json()
+                try:
+                    resp_data = response.json()
+                except ValueError:
+                    return JSONResponse(status_code=502, content={"error": {
+                        "message": "上游返回了无法解析的响应。", "type": "upstream_error",
+                        "code": "upstream_invalid_response",
+                    }})
+                failure = _upstream_failure(resp_data, final=True)
+                if failure:
+                    print(f"upstream_failure stream=False status={failure[0]}", flush=True)
+                    return JSONResponse(status_code=failure[0], content=failure[1])
                 assistant_msg = ""
                 assistant_tool_calls = None
                 assistant_reasoning = None
                 try:
                     msg_obj = resp_data["choices"][0]["message"]
-                    assistant_msg = msg_obj.get("content") or ""
+                    assistant_msg = msg_obj.get("content") or msg_obj.get("refusal") or ""
                     if msg_obj.get("tool_calls"):
                         assistant_tool_calls = msg_obj["tool_calls"]
                         print(f"🔧 Response 包含 {len(assistant_tool_calls)} 个工具调用")
@@ -2401,13 +2484,15 @@ async def stream_and_capture(
     reroll: bool = False,
     reroll_expected_assistant_id: int = None,
 ):
-    """流式响应 + 捕获完整回复（原始字节透传，确保SSE格式和thinking数据完整）"""
+    """逐帧透传有效 SSE 并捕获完整回复；失败响应回传错误，不进入记忆。"""
     full_response = []
     full_reasoning = []
     stream_usage = {}
-    line_buffer = ""
+    full_refusal = []
     accumulated_tool_calls = {}  # index -> OpenAI-compatible tool call
     stream_succeeded = False
+    done_frame = None
+    finish_reason = None
     
     async with httpx.AsyncClient(timeout=300) as client:
         async with client.stream("POST", API_BASE_URL, headers=headers, json=body) as response:
@@ -2415,85 +2500,107 @@ async def stream_and_capture(
             upstream_ct = response.headers.get("content-type", "")
             print(f"📨 上游响应: status={response.status_code}, content-type={upstream_ct}", flush=True)
             
-            # 上游非200时，提前打印messages结构方便debug
-            if response.status_code != 200:
-                msg_summary = [{"role": m.get("role"), "tool_calls": bool(m.get("tool_calls")), "tool_call_id": m.get("tool_call_id", ""), "content_type": type(m.get("content")).__name__} for m in body.get("messages", [])]
-                print(f"❌ 发送的messages结构({len(msg_summary)}条): {msg_summary}", flush=True)
-            
-            error_body_parts = []
-            is_error = response.status_code != 200
-            
-            async for chunk in response.aiter_bytes():
-                # 原始字节直接透传给客户端
-                yield chunk
-                
-                if is_error:
-                    error_body_parts.append(chunk)
-                    continue
-                
-                # 旁路解析：从字节流中提取assistant回复内容，用于后续记忆提取
-                text = chunk.decode("utf-8", errors="ignore")
-                line_buffer += text
-                while "\n" in line_buffer:
-                    line, line_buffer = line_buffer.split("\n", 1)
-                    line = line.strip()
-                    if line.startswith("data: ") and line != "data: [DONE]":
-                        try:
-                            data = json.loads(line[6:])
-                            
-                            if "usage" in data:
-                                stream_usage = data["usage"]
-                            
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                full_response.append(content)
-                            
-                            # 收集reasoning_content（deepseek thinking mode）
-                            reasoning = delta.get("reasoning_content", "")
-                            if reasoning:
-                                full_reasoning.append(reasoning)
-                            
-                            # 累积tool_calls
-                            if "tool_calls" in delta:
-                                for tc in delta["tool_calls"]:
-                                    idx = tc.get("index", 0)
-                                    if idx not in accumulated_tool_calls:
-                                        accumulated_tool_calls[idx] = {
-                                            "index": idx,
-                                            "id": tc.get("id", ""),
-                                            "type": tc.get("type", "function"),
-                                            "function": {"name": "", "arguments": ""}
-                                        }
-                                    if tc.get("id"):
-                                        accumulated_tool_calls[idx]["id"] = tc["id"]
-                                    for key, value in tc.items():
-                                        if key not in {"index", "id", "type", "function"}:
-                                            accumulated_tool_calls[idx][key] = value
-                                    if "function" in tc:
-                                        fn = tc["function"]
-                                        if fn.get("name"):
-                                            accumulated_tool_calls[idx]["function"]["name"] = fn["name"]
-                                        if "arguments" in fn:
-                                            accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
-                                        for key, value in fn.items():
-                                            if key not in {"name", "arguments"}:
-                                                accumulated_tool_calls[idx]["function"][key] = value
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            pass
-            stream_succeeded = response.status_code == 200
+            if response.status_code != 200 or "text/event-stream" not in upstream_ct.lower():
+                raw = await response.aread()
+                try:
+                    data = json.loads(raw)
+                    failure = _upstream_failure(data, final=True)
+                except (ValueError, UnicodeDecodeError):
+                    failure = None
+                if failure is None:
+                    failure = (502, {"error": {
+                        "message": "上游未返回有效的流式响应。", "type": "upstream_error",
+                        "code": "upstream_invalid_response",
+                    }})
+                yield _upstream_failure_sse(failure)
+                return
+
+            async for frame in _upstream_sse_frames(response):
+                data_text = "\n".join(line[5:].lstrip(" ") for line in frame.decode("utf-8").splitlines()
+                                      if line.startswith("data:"))
+                if data_text == "[DONE]":
+                    done_frame = frame
+                    break
+                if data_text:
+                    try:
+                        data = json.loads(data_text)
+                        failure = _upstream_failure(data)
+                        if failure:
+                            yield _upstream_failure_sse(failure)
+                            return
+                        if "usage" in data and isinstance(data["usage"], dict):
+                            stream_usage = data["usage"]
+                        choices = data.get("choices") or [{}]
+                        choice = choices[0]
+                        finish_reason = choice.get("finish_reason") or finish_reason
+                        delta = choice.get("delta") or {}
+                        content = delta.get("content", "")
+                        if content:
+                            full_response.append(content)
+                            failure = _upstream_failure({"choices": [{"message": {
+                                "content": "".join(full_response)[:512],
+                            }}]})
+                            if failure:
+                                yield _upstream_failure_sse(failure)
+                                return
+                        if delta.get("refusal"):
+                            full_refusal.append(delta["refusal"])
+
+                        # 收集reasoning_content（deepseek thinking mode）
+                        reasoning = delta.get("reasoning_content", "")
+                        if reasoning:
+                            full_reasoning.append(reasoning)
+
+                        # 累积tool_calls
+                        if "tool_calls" in delta:
+                            for tc in delta["tool_calls"]:
+                                idx = tc.get("index", 0)
+                                if idx not in accumulated_tool_calls:
+                                    accumulated_tool_calls[idx] = {
+                                        "index": idx,
+                                        "id": tc.get("id", ""),
+                                        "type": tc.get("type", "function"),
+                                        "function": {"name": "", "arguments": ""}
+                                    }
+                                if tc.get("id"):
+                                    accumulated_tool_calls[idx]["id"] = tc["id"]
+                                for key, value in tc.items():
+                                    if key not in {"index", "id", "type", "function"}:
+                                        accumulated_tool_calls[idx][key] = value
+                                if "function" in tc:
+                                    fn = tc["function"]
+                                    if fn.get("name"):
+                                        accumulated_tool_calls[idx]["function"]["name"] = fn["name"]
+                                    if "arguments" in fn:
+                                        accumulated_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+                                    for key, value in fn.items():
+                                        if key not in {"name", "arguments"}:
+                                            accumulated_tool_calls[idx]["function"][key] = value
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        pass
+                yield frame
+            failure = _upstream_failure({"choices": [{"message": {
+                "content": "".join(full_response),
+                "tool_calls": list(accumulated_tool_calls.values()),
+                "refusal": "".join(full_refusal),
+            }}]}, final=True)
+            if failure is None and done_frame is None and not finish_reason:
+                failure = (502, {"error": {
+                    "message": "上游连接结束，但回复未完成。", "type": "upstream_error",
+                    "code": "upstream_incomplete_response",
+                }})
+            if failure:
+                yield _upstream_failure_sse(failure)
+                return
+            stream_succeeded = True
+            yield done_frame or b"data: [DONE]\n\n"
     
-    assistant_msg = "".join(full_response)
+    assistant_msg = "".join(full_response) or "".join(full_refusal)
     assistant_reasoning = "".join(full_reasoning) if full_reasoning else None
     assistant_tool_calls = list(accumulated_tool_calls.values()) if accumulated_tool_calls else None
     
     if assistant_reasoning:
         print(f"🧠 Stream response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
-    
-    # 打印上游错误内容
-    if error_body_parts:
-        error_text = b"".join(error_body_parts).decode("utf-8", errors="ignore")[:500]
-        print(f"❌ 上游错误内容: {error_text}", flush=True)
     
     if assistant_tool_calls:
         print(f"🔧 Stream response 包含 {len(assistant_tool_calls)} 个工具调用")
@@ -2516,7 +2623,7 @@ async def stream_and_capture(
             asyncio.create_task(save_token_usage(session_id, model, pt, ct, tt))
             print(f"📊 Stream Token: {pt} + {ct} = {tt}")
     
-    if conversation_persistence_enabled() and (user_message or tool_messages):
+    if stream_succeeded and conversation_persistence_enabled() and (user_message or tool_messages):
         asyncio.create_task(
             process_memories_background(session_id, user_message, assistant_msg, model, 
                                         context_messages=extraction_context_messages,
