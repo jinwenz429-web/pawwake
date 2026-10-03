@@ -227,7 +227,8 @@ pawwake/
 
 | 路径 | 方法 | 说明 |
 |------|------|------|
-| `/` | GET | 健康检查，查看网关状态 |
+| `/` | GET | 查看网关和记忆状态（读取数据库） |
+| `/health` | GET/HEAD | 轻量存活检查，供 UptimeRobot 使用；不访问数据库或模型 |
 | `/v1/chat/completions` | POST | 核心转发接口（OpenAI 兼容） |
 | `/v1/models` | GET | 模型列表 |
 | `/dashboard/login` | GET/POST | Dashboard 独立密码登录 |

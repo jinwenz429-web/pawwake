@@ -1844,6 +1844,12 @@ async def process_memories_background(
 # API 接口
 # ============================================================
 
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def liveness_check():
+    """Lightweight uptime check: no database reads or upstream API calls."""
+    return {"status": "ok"}
+
+
 @app.get("/")
 async def health_check():
     """健康检查"""
