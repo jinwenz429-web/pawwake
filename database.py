@@ -857,7 +857,9 @@ async def delete_assistant_rounds(session_id: str, round_ids: list) -> bool:
     return True
 
 
-async def delete_auxiliary_suggestion_messages(session_id: str, ranges: list) -> bool:
+async def delete_auxiliary_suggestion_messages(
+    session_id: str, ranges: list, *, preserve_cache: bool = False,
+) -> bool:
     """Remove stored Kelivo suggestion prompts and replies from a session."""
     if not ranges:
         return True
@@ -903,9 +905,10 @@ async def delete_auxiliary_suggestion_messages(session_id: str, ranges: list) ->
                     "DELETE FROM conversations WHERE session_id = $1 AND id >= $2 AND id <= $3",
                     session_id, start_id, end_id,
                 )
-            await conn.execute(
-                "DELETE FROM session_cache_state WHERE session_id = $1", session_id,
-            )
+            if not preserve_cache:
+                await conn.execute(
+                    "DELETE FROM session_cache_state WHERE session_id = $1", session_id,
+                )
     return True
 
 

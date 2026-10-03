@@ -238,7 +238,7 @@ class PartitionRerollTests(unittest.TestCase):
             stack.enter_context(patch.object(main, "FORCE_STREAM", False))
             stack.enter_context(patch.object(main, "get_system_prompt", lambda: asyncio.sleep(0, result="")))
             stack.enter_context(patch.object(main, "get_conversation_messages", fake_history))
-            stack.enter_context(patch.object(main, "delete_auxiliary_suggestion_messages", lambda *a: asyncio.sleep(0, result=True)))
+            stack.enter_context(patch.object(main, "delete_auxiliary_suggestion_messages", lambda *a, **kw: asyncio.sleep(0, result=True)))
             stack.enter_context(patch.object(main, "delete_redundant_reroll_tail", lambda *a: asyncio.sleep(0, result=True)))
             stack.enter_context(patch.object(main, "delete_assistant_rounds", lambda *a: asyncio.sleep(0, result=True)))
             stack.enter_context(patch.object(main, "archive_replaced_answer_memories", lambda *a: asyncio.sleep(0)))
@@ -539,6 +539,17 @@ class AuxiliarySuggestionTests(unittest.TestCase):
         delete = next(i for i, query in enumerate(connection.queries) if "DELETE FROM conversations" in query)
         self.assertLess(archive, delete)
         self.assertIn("memory_message_sources", connection.queries[archive])
+
+        # Removing an auxiliary round still in A/B must retain the existing
+        # summary cursor, while the default cleanup invalidates older summaries.
+        self.assertTrue(any("DELETE FROM session_cache_state" in query for query in connection.queries))
+        connection.queries.clear()
+        with patch.object(database, "get_pool", return_value=Pool(connection)):
+            self.assertTrue(asyncio.run(database.delete_auxiliary_suggestion_messages(
+                "same-session", [(3, 4, self.suggestion_prompt)], preserve_cache=True,
+            )))
+        self.assertTrue(any("DELETE FROM conversations" in query for query in connection.queries))
+        self.assertFalse(any("DELETE FROM session_cache_state" in query for query in connection.queries))
 
 
 class DeletedAssistantTests(unittest.TestCase):

@@ -14,6 +14,35 @@ from database import get_pool
 REBUILD_BATCH_SIZE = int(os.getenv("MEMORY_REBUILD_BATCH_SIZE", "25"))
 REBUILD_GROUP_SIZE = int(os.getenv("MEMORY_REBUILD_GROUP_SIZE", "45"))
 REBUILD_MAX_TOKENS = int(os.getenv("MEMORY_REBUILD_MAX_TOKENS", "8000"))
+REBUILD_SCOPE = "unprocessed_fragments"
+
+# Applied plans also cover unchanged KEEP sources and created memories whose
+# merged_from links may later be cleared by archive cleanup. Previews do not.
+_ACTIVE_MEMORIES_SQL = """
+    SELECT m.id, m.content, m.importance, m.layer, m.title,
+           m.created_at, m.event_date, m.merged_from,
+           EXISTS (
+               SELECT 1 FROM memory_rebuild_plans p
+               WHERE p.status = 'applied' AND (
+                   (p.plan->'source_hashes') ? m.id::text
+                   OR COALESCE(p.apply_result->'created_ids', '[]'::jsonb)
+                      @> jsonb_build_array(m.id)
+               )
+           ) AS was_rebuilt
+    FROM memories m
+    WHERE m.is_active = TRUE
+    ORDER BY m.id
+"""
+
+
+def _is_unprocessed_fragment(memory) -> bool:
+    return (int(memory.get("layer") or 1) == 1
+            and not memory.get("merged_from")
+            and not memory.get("was_rebuilt", False))
+
+
+def _is_fragment_plan(plan) -> bool:
+    return plan.get("version") == 2 and plan.get("scope") == REBUILD_SCOPE
 
 DOMAINS = (
     "identity",
@@ -132,17 +161,14 @@ async def ensure_rebuild_table():
 
 
 async def _load_active_memories():
+    """Load only active fragments that have never been successfully organized."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, content, importance, layer, title,
-                   created_at, event_date, merged_from
-            FROM memories
-            WHERE is_active = TRUE
-            ORDER BY id
-        """)
+        rows = await conn.fetch(_ACTIVE_MEMORIES_SQL)
     result = []
     for row in rows:
+        if not _is_unprocessed_fragment(row):
+            continue
         result.append({
             "id": int(row["id"]),
             "content": row["content"] or "",
@@ -377,6 +403,7 @@ async def _synthesize_domain(candidates, domain):
 
 async def _save_plan(source_memories, actions):
     summary = {
+        "scope": REBUILD_SCOPE,
         "source_count": len(source_memories),
         "action_count": len(actions),
         "discarded_sources": sum(
@@ -393,7 +420,8 @@ async def _save_plan(source_memories, actions):
         ),
     }
     plan = {
-        "version": 1,
+        "version": 2,
+        "scope": REBUILD_SCOPE,
         "source_hashes": {
             str(item["id"]): _content_hash(item["content"])
             for item in source_memories
@@ -432,7 +460,8 @@ async def run_memory_rebuild_preview():
         source_memories = await _load_active_memories()
         _status["total"] = len(source_memories)
         if not source_memories:
-            raise RuntimeError("没有活跃记忆可整理")
+            _status.update(running=False, phase="empty")
+            return {"status": "empty", **_status}
 
         source_map = {item["id"]: item for item in source_memories}
         classified = []
@@ -445,7 +474,7 @@ async def run_memory_rebuild_preview():
             classified.extend(result)
             _status["processed"] = min(index + len(batch), len(source_memories))
             print(
-                f"🧠 整库重整分类进度: {_status['processed']}/{len(source_memories)}",
+                f"🧠 碎片重整分类进度: {_status['processed']}/{len(source_memories)}",
                 flush=True,
             )
 
@@ -474,7 +503,7 @@ async def run_memory_rebuild_preview():
                 continue
             actions.extend(await _synthesize_domain(candidates, domain))
             print(
-                f"🧩 整库重整领域完成: {domain} ({len(candidates)} 条候选)",
+                f"🧩 碎片重整领域完成: {domain} ({len(candidates)} 条候选)",
                 flush=True,
             )
 
@@ -490,7 +519,7 @@ async def run_memory_rebuild_preview():
             "error": None,
         })
         print(
-            "✅ 整库重整 dry-run 完成: "
+            "✅ 碎片重整 dry-run 完成: "
             f"plan_id={plan_id}, source={summary['source_count']}, "
             f"actions={summary['action_count']}, "
             f"discard={summary['discarded_sources']}, "
@@ -504,7 +533,7 @@ async def run_memory_rebuild_preview():
             "phase": "error",
             "error": str(exc),
         })
-        print(f"⚠️ 整库重整 dry-run 失败: {exc}", flush=True)
+        print(f"⚠️ 碎片重整 dry-run 失败: {exc}", flush=True)
         return {"status": "error", **_status}
 
 
@@ -531,7 +560,8 @@ def _jsonb_object(value):
 async def get_memory_rebuild_status():
     """返回当前任务状态；进程重启后自动回退到 Neon 中最近一次持久化方案。"""
     result = dict(_status)
-    if result.get("running") or result.get("plan_id") or result.get("error"):
+    if (result.get("running") or result.get("plan_id") or result.get("error")
+            or result.get("phase") == "empty"):
         return result
 
     await ensure_rebuild_table()
@@ -570,22 +600,24 @@ async def get_memory_rebuild_plan(plan_id: int):
         )
     if not row:
         return None
+    plan = _jsonb_object(row["plan"])
     return {
         "id": int(row["id"]),
         "created_at": row["created_at"].isoformat(),
         "status": row["status"],
         "source_count": int(row["source_count"]),
         "summary": _jsonb_object(row["summary"]),
-        "plan": _jsonb_object(row["plan"]),
+        "plan": plan,
+        "can_apply": row["status"] == "preview" and _is_fragment_plan(plan),
         "applied_at": row["applied_at"].isoformat() if row["applied_at"] else None,
         "apply_result": _jsonb_object(row["apply_result"]) if row["apply_result"] else None,
     }
 
 
 def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int) -> dict:
-    """Validate the complete saved plan against the locked active snapshot."""
-    if plan.get("version") != 1:
-        raise ValueError("不支持的重整方案版本")
+    """Validate only the saved fragment sources against the locked snapshot."""
+    if not _is_fragment_plan(plan):
+        raise RebuildApplyConflict("旧整库方案已停用，请重新生成仅整理新碎片的方案")
     source_hashes = plan.get("source_hashes")
     if not isinstance(source_hashes, dict) or len(source_hashes) != source_count:
         raise ValueError("方案来源数量不一致")
@@ -595,9 +627,10 @@ def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int) 
         raise ValueError("方案来源 ID 无效") from exc
     if len(expected_ids) != len(source_hashes):
         raise ValueError("方案来源 ID 重复")
-    source_map = {int(item["id"]): item for item in active_sources}
+    source_map = {int(item["id"]): item for item in active_sources
+                  if int(item["id"]) in expected_ids and _is_unprocessed_fragment(item)}
     if set(source_map) != expected_ids:
-        raise RebuildApplyConflict("活跃记忆集合已变化，请重新生成并审阅方案")
+        raise RebuildApplyConflict("来源碎片已变化或已整理，请重新生成并审阅方案")
     for source_id, source in source_map.items():
         if _content_hash(source["content"]) != source_hashes[str(source_id)]:
             raise RebuildApplyConflict(
@@ -663,11 +696,7 @@ async def apply_memory_rebuild_plan(plan_id: int, confirmed_plan_id: int) -> dic
 
             # Exclude concurrent INSERT/UPDATE while comparing the saved snapshot.
             await conn.execute("LOCK TABLE memories IN SHARE ROW EXCLUSIVE MODE")
-            active_rows = await conn.fetch(
-                """SELECT id, content, importance, layer, title,
-                          event_date, created_at
-                   FROM memories WHERE is_active = TRUE ORDER BY id"""
-            )
+            active_rows = await conn.fetch(_ACTIVE_MEMORIES_SQL)
             prepared = _prepare_rebuild_apply(
                 _jsonb_object(row["plan"]), active_rows, int(row["source_count"])
             )

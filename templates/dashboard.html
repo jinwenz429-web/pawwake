@@ -98,7 +98,7 @@
                         </select>
                         <div class="toolbar-actions">
                             <button class="btn btn-warning" id="consolidateBtn" onclick="openConsolidateModal()">整理记忆</button>
-                            <button class="btn btn-primary" id="rebuildBtn" onclick="openRebuildModal()">整库重整</button>
+                            <button class="btn btn-primary" id="rebuildBtn" onclick="openRebuildModal()">整理新碎片</button>
                             <label class="checkbox-label">
                                 <input type="checkbox" id="selectAll" onchange="toggleAll()">
                                 <span>全选</span>
@@ -211,18 +211,18 @@
                 </div>
             </div>
 
-            <!-- 整库重整弹窗 -->
+            <!-- 未整理碎片弹窗 -->
             <div id="rebuildModal" class="modal" style="display:none;">
                 <div class="modal-content modal-wide">
-                    <h3>整库重整</h3>
-                    <p>模型会重新审查全部活跃记忆，生成 KEEP / MERGE / EVENT / DISCARD 方案。</p>
+                    <h3>整理新碎片</h3>
+                    <p>只整理活跃且尚未整理过的碎片记忆，生成 KEEP / MERGE / EVENT / DISCARD 方案。已整理的记忆、事件记忆和核心记忆会跳过。</p>
                     <p class="hint">先生成并审阅方案；点击应用后会再次核对全部来源，整批写入可回滚。原记忆仅软归档，不永久删除。</p>
                     <div id="rebuildStatus" style="margin: 14px 0; color: var(--text-light);">尚未运行</div>
                     <div id="rebuildSummary" class="card" style="display:none; padding:14px; margin:12px 0;"></div>
                     <div id="rebuildPlanPreview" style="max-height:420px; overflow:auto;"></div>
                     <div class="modal-actions">
                         <button class="btn btn-secondary" onclick="closeRebuildModal()">关闭</button>
-                        <button class="btn btn-primary" id="startRebuildBtn" onclick="startMemoryRebuild()">生成重整方案</button>
+                        <button class="btn btn-primary" id="startRebuildBtn" onclick="startMemoryRebuild()">生成碎片整理方案</button>
                         <button class="btn btn-danger" id="applyRebuildBtn" style="display:none;" onclick="applyMemoryRebuild()">应用已审阅方案</button>
                     </div>
                 </div>

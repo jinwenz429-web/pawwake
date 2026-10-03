@@ -22,7 +22,8 @@ class MemoryRebuildApplyTests(unittest.TestCase):
              "title": "", "event_date": None, "created_at": None},
         ]
         self.plan = {
-            "version": 1,
+            "version": 2,
+            "scope": "unprocessed_fragments",
             "source_hashes": {str(item["id"]): _content_hash(item["content"])
                               for item in self.sources},
             "actions": [
@@ -40,17 +41,36 @@ class MemoryRebuildApplyTests(unittest.TestCase):
         self.assertEqual(result["creates"][0]["merged_from"], [1, 2])
         self.assertEqual(result["creates"][0]["layer"], 3)
 
-    def test_changed_or_new_active_memory_rejects_stale_plan(self):
+    def test_changed_or_missing_source_rejects_stale_plan(self):
         changed = [dict(item) for item in self.sources]
         changed[0]["content"] = "edited after preview"
         with self.assertRaises(RebuildApplyConflict):
             _prepare_rebuild_apply(self.plan, changed, 3)
         with self.assertRaises(RebuildApplyConflict):
             _prepare_rebuild_apply(self.plan, self.sources[:2], 3)
+
+    def test_new_memories_after_preview_are_left_for_the_next_run(self):
+        result = _prepare_rebuild_apply(self.plan, self.sources + [
+            {"id": 4, "content": "new", "importance": 5, "layer": 1,
+             "title": "", "event_date": None, "created_at": None},
+            {"id": 5, "content": "existing core", "importance": 8, "layer": 3,
+             "title": "core", "event_date": None, "created_at": None}], 3)
+        self.assertEqual(result["archive_ids"], [1, 2, 3])
+
+    def test_old_whole_library_plan_cannot_be_applied(self):
+        self.plan["version"] = 1
+        self.plan.pop("scope")
         with self.assertRaises(RebuildApplyConflict):
-            _prepare_rebuild_apply(self.plan, self.sources + [
-                {"id": 4, "content": "new", "importance": 5, "layer": 1,
-                 "title": "", "event_date": None, "created_at": None}], 3)
+            _prepare_rebuild_apply(self.plan, self.sources, 3)
+
+    def test_plan_cannot_touch_event_core_or_previously_processed_sources(self):
+        for changes in ({"layer": 2}, {"layer": 3}, {"merged_from": [99]},
+                        {"was_rebuilt": True}):
+            with self.subTest(changes=changes):
+                sources = [dict(item) for item in self.sources]
+                sources[0].update(changes)
+                with self.assertRaises(RebuildApplyConflict):
+                    _prepare_rebuild_apply(self.plan, sources, 3)
 
     def test_keep_unchanged_is_retained_but_normalized_keep_is_replaced(self):
         self.plan["actions"] = [
@@ -94,8 +114,13 @@ class FakeConnection:
         raise AssertionError(sql)
 
     async def fetch(self, sql, *args):
-        if "WHERE is_active = TRUE ORDER BY id" in sql:
-            return [row for row in self.sources.values() if row["is_active"]]
+        if "FROM memories" in sql:
+            applied = self.plan["status"] == "applied"
+            source_ids = self.plan["plan"].get("source_hashes", {})
+            created_ids = self.plan.get("apply_result", {}).get("created_ids", [])
+            return [dict(row, was_rebuilt=applied and (
+                str(row["id"]) in source_ids or row["id"] in created_ids
+            )) for row in self.sources.values() if row["is_active"]]
         raise AssertionError(sql)
 
     async def execute(self, sql, *args):
@@ -110,6 +135,8 @@ class FakeConnection:
             return f"UPDATE {changed}"
         if "UPDATE memory_rebuild_plans" in sql:
             self.plan["status"] = "applied"
+            import json
+            self.plan["apply_result"] = json.loads(args[1])
             return "UPDATE 1"
         raise AssertionError(sql)
 
@@ -139,7 +166,8 @@ class MemoryRebuildTransactionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         sources = [{"id": 1, "content": "a", "importance": 5, "layer": 1,
                     "title": "", "event_date": None, "created_at": None}]
-        plan = {"version": 1, "source_hashes": {"1": _content_hash("a")},
+        plan = {"version": 2, "scope": "unprocessed_fragments",
+                "source_hashes": {"1": _content_hash("a")},
                 "actions": [{"action": "KEEP", "source_ids": [1],
                              "target_layer": 3, "title": "a", "content": "A",
                              "importance": 8, "reason": "normalize"}]}

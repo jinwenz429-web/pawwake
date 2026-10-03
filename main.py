@@ -23,6 +23,7 @@ import hmac
 import logging
 import secrets
 import time
+import weakref
 from functools import lru_cache
 import httpx
 from datetime import datetime, timedelta, timezone
@@ -762,13 +763,14 @@ def _is_title_generation_request(messages: list) -> bool:
 
 def _is_chat_suggestion_request(messages: list) -> bool:
     """Recognize Kelivo's background follow-up suggestion call."""
-    non_system = [m for m in messages if m.get("role") != "system"]
-    if len(non_system) != 1 or non_system[0].get("role") != "user":
+    users = [m for m in messages if m.get("role") == "user"]
+    if len(users) != 1 or any(m.get("role") == "tool" or m.get("tool_calls") for m in messages):
         return False
     system_text = _extract_client_system_text(messages)
     return (
         "Generate candidate next messages that the USER can send to the assistant" in system_text
         and '"suggestions"' in system_text
+        and _is_stored_chat_suggestion_prompt(_message_text(users[0]).strip())
     )
 
 
@@ -793,6 +795,15 @@ def _auxiliary_suggestion_ranges(db_history: list) -> list:
         end_id = db_history[following - 1]["id"] if following > index else row["id"]
         ranges.append((row["id"], end_id, row["content"]))
     return ranges
+
+
+def _can_preserve_partition_cache(db_history: list, ranges: list, a_start_round: int) -> bool:
+    """Only invalidate summaries if removed rows were already compressed."""
+    row_rounds = {row["id"]: index
+                  for index, rows in enumerate(group_by_rounds(db_history))
+                  for row in rows}
+    return all(start_id in row_rounds and row_rounds[start_id] >= a_start_round
+               for start_id, _, _ in ranges)
 
 
 # 分区缓存模式下拼接到 system prompt 尾部的记忆使用说明。
@@ -1126,8 +1137,18 @@ def _should_rotate(b_rounds_count: int, X: int, a_msgs: list) -> bool:
     
     return b_rounds_count >= X
 
-# 时间窗口模式下单次请求最大轮转次数（防止一口气压完所有历史）
+# 所有模式都限制单次轮转次数与总等待时间，积压历史分次处理。
 CACHE_MAX_ROTATIONS = int(os.getenv("CACHE_MAX_ROTATIONS", "2"))
+CACHE_SUMMARY_BUDGET_SECONDS = max(0.0, float(os.getenv("CACHE_SUMMARY_BUDGET_SECONDS", "20")))
+_partition_build_locks = weakref.WeakValueDictionary()
+
+
+def _partition_build_lock(session_id: str) -> asyncio.Lock:
+    lock = _partition_build_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _partition_build_locks[session_id] = lock
+    return lock
 
 
 def _apply_breakpoint(msg: dict) -> bool:
@@ -1162,6 +1183,36 @@ async def build_partitioned_messages(
     user_message: str,
     conversation_recall_text: str = "",
     active_tool_call_ids: set | None = None,
+) -> list:
+    deadline = time.monotonic() + CACHE_SUMMARY_BUDGET_SECONDS
+    lock = _partition_build_lock(session_id)
+    try:
+        await asyncio.wait_for(lock.acquire(), max(0, deadline - time.monotonic()))
+    except asyncio.TimeoutError:
+        # Another request is summarizing this session. Use the last committed
+        # cursor and original messages without starting more summary work.
+        print("⏳ 摘要等待预算已用完：本次保留原始上下文，延后轮转")
+        return await _build_partitioned_messages(
+            session_id, all_messages, base_prompt, user_message,
+            conversation_recall_text, active_tool_call_ids, summary_deadline=deadline,
+        )
+    try:
+        return await _build_partitioned_messages(
+            session_id, all_messages, base_prompt, user_message,
+            conversation_recall_text, active_tool_call_ids, summary_deadline=deadline,
+        )
+    finally:
+        lock.release()
+
+
+async def _build_partitioned_messages(
+    session_id: str,
+    all_messages: list,
+    base_prompt: str,
+    user_message: str,
+    conversation_recall_text: str = "",
+    active_tool_call_ids: set | None = None,
+    *, summary_deadline: float,
 ) -> list:
     """
     分区缓存模式：构建带breakpoint的messages数组。
@@ -1219,7 +1270,7 @@ async def build_partitioned_messages(
                 active_tool_round = index
     
     state = await get_session_cache_state(session_id)
-    summary_parts = state['summary_parts']
+    summary_parts = list(state['summary_parts'])
     a_start_round = state['a_start_round']
     
     if total_rounds < X:
@@ -1241,18 +1292,25 @@ async def build_partitioned_messages(
     b_rounds_count = len(b_round_groups)
     
     rotation_count = 0
-    max_rotations = CACHE_MAX_ROTATIONS if CACHE_PARTITION_TRIGGER == "time" else 999
+    max_rotations = max(1, CACHE_MAX_ROTATIONS)
     while _should_rotate(b_rounds_count, X, a_msgs) and rotation_count < max_rotations:
         if active_tool_round is not None and a_start_round <= active_tool_round < a_end_round:
             break
-        rotation_count += 1
+        remaining = summary_deadline - time.monotonic()
+        if remaining <= 0:
+            break
         trigger_info = f"B区{b_rounds_count}轮 >= X={X}" if CACHE_PARTITION_TRIGGER != "time" else f"A区首条消息超出{CACHE_PARTITION_WINDOW}分钟窗口"
         print(
-            f"🔄 轮转#{rotation_count}: "
+            f"🔄 轮转#{rotation_count + 1}: "
             f"id_hash={_partition_session_id_hash(session_id)}, {trigger_info}"
         )
         
-        new_summary = await generate_summary(a_msgs, session_id)
+        try:
+            new_summary = await asyncio.wait_for(generate_summary(a_msgs, session_id), remaining)
+        except asyncio.TimeoutError:
+            print("⏳ 摘要总等待预算已用完：保留未完成部分的原文，下次再整理")
+            break
+        rotation_count += 1
         if new_summary:
             summary_parts.append(new_summary)
         elif CACHE_SUMMARY_MODEL:
@@ -1906,7 +1964,15 @@ async def _chat_completions_inner(request: Request):
             db_history = await get_conversation_messages(session_id, limit=10000)
             auxiliary_ranges = _auxiliary_suggestion_ranges(db_history or [])
             if auxiliary_ranges:
-                if not await delete_auxiliary_suggestion_messages(session_id, auxiliary_ranges):
+                async with _partition_build_lock(session_id):
+                    cache_state = await get_session_cache_state(session_id)
+                    preserve_cache = _can_preserve_partition_cache(
+                        db_history, auxiliary_ranges, cache_state['a_start_round'],
+                    )
+                    removed = await delete_auxiliary_suggestion_messages(
+                        session_id, auxiliary_ranges, preserve_cache=preserve_cache,
+                    )
+                if not removed:
                     return JSONResponse(status_code=409, content={"error": {
                         "message": "Conversation changed; retry this request.",
                         "type": "conversation_sync_conflict",

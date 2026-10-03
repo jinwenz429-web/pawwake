@@ -834,7 +834,7 @@ async function doConsolidate() {
 }
 
 // ============================================
-// 整库重整：Dry Run 与人工确认 Apply
+// 未整理碎片：Dry Run 与人工确认 Apply
 // ============================================
 let rebuildPollTimer = null;
 let rebuildActivePlan = null;
@@ -866,7 +866,7 @@ function closeRebuildModal() {
 async function startMemoryRebuild() {
     const btn = document.getElementById('startRebuildBtn');
     btn.disabled = true;
-    document.getElementById('rebuildStatus').textContent = '正在启动整库重整...';
+    document.getElementById('rebuildStatus').textContent = '正在读取未整理的碎片...';
     document.getElementById('rebuildSummary').style.display = 'none';
     document.getElementById('rebuildPlanPreview').innerHTML = '';
     document.getElementById('applyRebuildBtn').style.display = 'none';
@@ -899,7 +899,7 @@ async function refreshMemoryRebuildStatus() {
         if (status.running) {
             btn.disabled = true;
             const phaseNames = {
-                loading: '读取记忆',
+                loading: '读取未整理碎片',
                 classifying: '逐条判断长期价值',
                 synthesizing: '合并与事件化'
             };
@@ -915,6 +915,14 @@ async function refreshMemoryRebuildStatus() {
         }
         if (status.error) {
             statusEl.textContent = '❌ Dry Run 失败：' + status.error;
+            return;
+        }
+        if (status.phase === 'empty') {
+            rebuildActivePlan = null;
+            statusEl.textContent = '✅ 没有尚未整理的碎片，无需再次整理。';
+            document.getElementById('applyRebuildBtn').style.display = 'none';
+            document.getElementById('rebuildSummary').style.display = 'none';
+            document.getElementById('rebuildPlanPreview').innerHTML = '';
             return;
         }
         if (status.plan_id) {
@@ -940,7 +948,8 @@ async function loadMemoryRebuildPlan(planId) {
     summaryEl.style.display = 'block';
     summaryEl.innerHTML =
         '<strong>方案 #' + data.id + '</strong><br>' +
-        '来源 ' + (summary.source_count || 0) + ' 条 → 预计活跃 ' +
+        (summary.scope === 'unprocessed_fragments' ? '待整理碎片 ' : '历史方案来源 ') +
+        (summary.source_count || 0) + ' 条 → 本批预计保留 ' +
         (summary.estimated_active_after || 0) + ' 条；建议丢弃 ' +
         (summary.discarded_sources || 0) + ' 条；合并动作 ' +
         (summary.merge_actions || 0) + '；事件动作 ' +
@@ -974,7 +983,10 @@ async function loadMemoryRebuildPlan(planId) {
     document.getElementById('rebuildPlanPreview').innerHTML = html ||
         '<div class="hint">方案中没有动作。</div>';
     document.getElementById('applyRebuildBtn').style.display =
-        data.status === 'preview' ? '' : 'none';
+        data.can_apply === true ? '' : 'none';
+    if (data.status === 'preview' && data.can_apply !== true) {
+        summaryEl.innerHTML += '<br>此旧整库方案已停用，请重新生成碎片整理方案。';
+    }
 }
 
 async function applyMemoryRebuild() {

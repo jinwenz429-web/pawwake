@@ -79,7 +79,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `GATEWAY_SECRET`（强烈建议） | 程序 API 鉴权密钥，客户端通过 `X-Gateway-Key` 请求头发送 | 独立随机值 |
 | `DASHBOARD_PASSWORD` | Dashboard 登录密码，不与网关密钥共用 | 独立强密码 |
 | `SESSION_SECRET` | Dashboard 会话签名密钥，至少 32 字符且每次部署保持不变 | 独立随机值 |
-| `MEMORY_REBUILD_APPLY_TOKEN` | 整库重整 Apply 的独立密钥，至少 32 字符；不配置时 Apply 接口关闭 | 独立随机值 |
+| `MEMORY_REBUILD_APPLY_TOKEN` | 碎片整理 Apply 的独立密钥，至少 32 字符；不配置时 Apply 接口关闭 | 独立随机值 |
 
 5. 部署，访问你的网关地址看到 `{"status":"running"}` 就成功了
 
@@ -174,10 +174,13 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 | `PARTITION_SESSION_ID` | 固定的 session ID | `my-thread` |
 | `CACHE_PARTITION_TRIGGER`（可选） | 轮转触发方式：`rounds`（按轮次，默认）或 `time`（按时间窗口，适合微信等消息频率高的场景） | `rounds` |
 | `CACHE_PARTITION_WINDOW`（可选） | 时间窗口（分钟），仅 `trigger=time` 时生效。窗口内的消息不触发摘要压缩 | `30` |
-| `CACHE_MAX_ROTATIONS`（可选） | 时间窗口模式下单次请求最大轮转次数 | `2` |
+| `CACHE_MAX_ROTATIONS`（可选） | 所有触发模式下，单次请求最大轮转次数；积压历史分次整理 | `2` |
+| `CACHE_SUMMARY_BUDGET_SECONDS`（可选） | 单次请求等待同一对话的摘要任务及生成摘要的总预算（秒）。超时保留未完成部分的原文，不推进该部分的轮转 | `20` |
 | `CACHE_TTL`（可选） | 缓存有效期：`5m`（默认）或 `1h`。Anthropic 官方定价：5m 写入 1.25x、1h 写入 2x，读取都是 0.1x。消息间隔经常超过 5 分钟的慢聊场景（比如挂着微信/TG 等回复）建议 `1h`，缓存不会中途过期。OpenRouter 会原样透传此参数。设置面板可热更新 | `5m` |
 
 > 💡 **记忆与分区缓存可以独立开关。** `MEMORY_ENABLED=false` 会停止记忆检索、注入和提取；只要 `CACHE_PARTITION_ENABLED=true`，对话仍会落库并继续摘要轮转。分区模式由网关托管历史，因此必须保持数据库可用。
+
+聊天建议和标题生成属于辅助请求，跳过记忆、对话存储和摘要轮转。前置网关可用 `X-Skip-Conversation-Log: true` 显式传递用途。同一对话的摘要轮转共用进度；清理尚未压缩的建议记录时保留已有摘要，只有建议已进入摘要时才重置缓存。
 
 **管理面板：**
 
@@ -187,6 +190,12 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 - 查看、编辑、清空摘要内容
 - 新建对话线（可选择继承已有摘要）
 - 一键切换活跃对话线（运行时生效，不用重启）
+
+### 整理新碎片
+
+记忆页原「整库重整」改为「整理新碎片」：只选择活跃、第一层、没有合并来源且未被成功重整过的记忆。已应用方案的来源（包括原样 KEEP）及生成结果都会跳过；事件记忆和核心记忆不会再次压缩。仅生成预览不会把来源标记为已整理。
+
+先生成预览并审阅，再应用方案。旧版整库预览不能继续 Apply，需要重新生成碎片方案。预览后新增的碎片保留到下一批；若本批来源被修改、归档或已被另一方案处理，Apply 会拒绝执行。没有新碎片时直接提示无需整理，不调用模型。
 
 ### 第四阶段：关闭记忆（应急）
 
