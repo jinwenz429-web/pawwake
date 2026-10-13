@@ -41,6 +41,7 @@ from database import (
     import_memories_v2,
     repair_broken_merge_references,
     search_memories_with_mode,
+    list_all_session_cache_states,
 )
 from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, replace_last_conversation_round, archive_replaced_answer_memories, delete_assistant_rounds, delete_auxiliary_suggestion_messages, delete_redundant_reroll_tail, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
@@ -115,6 +116,7 @@ CACHE_PARTITION_ENABLED = os.getenv("CACHE_PARTITION_ENABLED", "false").lower() 
 CACHE_PARTITION_X = int(os.getenv("CACHE_PARTITION_X", "15"))
 CACHE_SUMMARY_MODEL = os.getenv("CACHE_SUMMARY_MODEL", "")  # 留空=不生成摘要，轮转时A区直接滑出（纯轮转模式）
 CACHE_SUMMARY_MAX_TOKENS = int(os.getenv("CACHE_SUMMARY_MAX_TOKENS", "2000"))  # 摘要输出上限，跟记忆提取的 MEMORY_MAX_TOKENS 各管各的。失败日志拿它当分母
+CACHE_SUMMARY_MAX_CHARS = max(1000, int(os.getenv("CACHE_SUMMARY_MAX_CHARS", "4000")))
 CACHE_PARTITION_TRIGGER = os.getenv("CACHE_PARTITION_TRIGGER", "rounds")  # rounds=按轮次 | time=按时间窗口
 CACHE_PARTITION_WINDOW = int(os.getenv("CACHE_PARTITION_WINDOW", "30"))  # 时间窗口（分钟），仅 trigger=time 时生效
 CACHE_TTL = os.getenv("CACHE_TTL", "5m")  # 缓存TTL：5m(默认) | 1h。1h写入费2x(5m是1.25x)读都0.1x，消息间隔常超5分钟的慢聊场景1h更划算
@@ -838,7 +840,7 @@ def build_time_injection() -> str:
     )
 
 
-async def generate_summary(messages: list, session_id: str = "") -> str:
+async def generate_summary(messages: list, session_id: str = "", *, consolidate: bool = False, max_chars: int = 300) -> str:
     """调用轻量模型压缩A区消息为摘要"""
     if not messages:
         return ""
@@ -852,10 +854,15 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
         content = msg['content'] if isinstance(msg['content'], str) else str(msg['content'])
         conversation_text += f"{role_label}: {content}\n\n"
     
-    prompt = f"""请将以下对话压缩成摘要。这份摘要会作为AI的记忆注入后续对话，请以AI的第一人称视角叙述（"我"指AI，用户用对话中的称呼）。
+    task = (
+        "以下材料是按时间排列的已有对话摘要。请合并成一份连续的总摘要，"
+        "删除重复信息，保留关系变化、未完成事项和关键约定；不要把摘要当成新发生的对话。"
+        if consolidate else "请将以下对话压缩成摘要。"
+    )
+    prompt = f"""{task}这份摘要会作为AI的记忆注入后续对话，请以AI的第一人称视角叙述（"我"指AI，用户用对话中的称呼）。
 优先保留：情感节点、关系里程碑、双方的约定和决定、正在进行的话题。
 保留双方的关键原话，用引号标注是谁说的。
-去掉日常寒暄和重复内容。控制在300字以内。
+去掉日常寒暄和重复内容。控制在{max_chars}字以内。
 
 ---
 {conversation_text}
@@ -886,6 +893,9 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
                     # 推理模型偶发返回content为None（思考吃光token或只返回reasoning_content）
                     # 空列表和缺字段都得接住：这条路走下去就是异常日志，它自己不能再抛
                     choice = (data.get("choices") or [{}])[0]
+                    if consolidate and choice.get("finish_reason") == "length":
+                        print("⚠️ 总摘要输出被截断：保留原摘要，下次重试")
+                        return ""
                     message = choice.get("message") or {}
                     content = message.get("content") or ""
                     summary = content.strip()
@@ -920,6 +930,43 @@ async def generate_summary(messages: list, session_id: str = "") -> str:
     except Exception as e:
         print(f"⚠️ 摘要生成异常: {e}")
         return ""
+
+
+async def compact_summary_parts(parts: list, session_id: str, deadline: float) -> list | None:
+    """Bound accumulated summaries without slicing text or changing the history cursor.
+
+    Keep the newest two blocks when they fit; consolidate the older prefix via
+    the existing summary model. Failure returns None so callers retain their
+    original state and the corresponding raw conversation rounds.
+    """
+    limit = CACHE_SUMMARY_MAX_CHARS
+    if sum(len(part) for part in parts) <= limit:
+        return list(parts)
+    keep = min(2, len(parts) - 1)
+    while keep and sum(len(part) for part in parts[-keep:]) > limit // 2:
+        keep -= 1
+    older = parts[:-keep] if keep else parts
+    recent = parts[-keep:] if keep else []
+    available = limit - sum(len(part) for part in recent)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        merged = await asyncio.wait_for(
+            generate_summary(
+                [{"role": "assistant", "content": '\n\n'.join(older)}], session_id,
+                consolidate=True, max_chars=min(1500, available // 2),
+            ), remaining,
+        )
+    except asyncio.TimeoutError:
+        print("⏳ 总摘要合并超出等待预算：保留原摘要和轮转位置")
+        return None
+    if not merged or len(merged) > available:
+        print("⚠️ 总摘要合并为空或超出长度限制：保留原摘要和轮转位置")
+        return None
+    result = [merged, *recent]
+    print(f"📝 总摘要合并: {len(parts)}段 → {len(result)}段，{sum(map(len, result))}/{limit}字")
+    return result
 
 
 def _strip_replayed_reasoning(msg: dict) -> dict:
@@ -1273,8 +1320,14 @@ async def _build_partitioned_messages(
     state = await get_session_cache_state(session_id)
     summary_parts = list(state['summary_parts'])
     a_start_round = state['a_start_round']
+    compacted = await compact_summary_parts(summary_parts, session_id, summary_deadline)
+    summary_changed = compacted is not None and compacted != summary_parts
+    if summary_changed:
+        summary_parts = compacted
     
     if total_rounds < X:
+        if summary_changed:
+            await save_session_cache_state(session_id, summary_parts, a_start_round)
         return await _build_basic_cached(
             history,
             base_prompt,
@@ -1311,19 +1364,26 @@ async def _build_partitioned_messages(
         except asyncio.TimeoutError:
             print("⏳ 摘要总等待预算已用完：保留未完成部分的原文，下次再整理")
             break
-        rotation_count += 1
+        candidate_parts = list(summary_parts)
         if new_summary:
-            summary_parts.append(new_summary)
+            candidate_parts.append(new_summary)
         elif CACHE_SUMMARY_MODEL:
             # 摘要失败不能让 A/B 分区无限增长。原始历史仍完整保存在数据库中，
             # 这里只追加有界占位摘要并继续推进滑窗，避免原文反复进入上游 prompt。
             fallback_summary = _summary_failure_archive_marker(a_msgs)
-            summary_parts.append(fallback_summary)
+            candidate_parts.append(fallback_summary)
             print(
                 "🗘 摘要生成失败：使用有界归档占位摘要继续轮转；"
                 "A区原文仍保存在数据库中"
             )
 
+        compacted = await compact_summary_parts(candidate_parts, session_id, summary_deadline)
+        if compacted is None:
+            # Do not commit the new summary or advance past its raw messages.
+            break
+        summary_parts = compacted
+        rotation_count += 1
+        summary_changed = True
         a_start_round += X
         a_end_round = a_start_round + X
         a_round_groups = rounds[a_start_round : a_end_round]
@@ -1341,7 +1401,7 @@ async def _build_partitioned_messages(
         b_msgs = [msg for rnd in b_round_groups for msg in rnd]
         b_rounds_count = len(b_round_groups)
     
-    if rotation_count > 0:
+    if summary_changed:
         await save_session_cache_state(session_id, summary_parts, a_start_round)
         summary_total = sum(len(p) for p in summary_parts)
         print(f"🔄 轮转完成(共{rotation_count}次): 摘要{len(summary_parts)}段/{summary_total}字, A区{len(a_msgs)}条, B区{len(b_msgs)}条")
