@@ -55,6 +55,8 @@ from memory_rebuilder import (
     RebuildApplyConflict,
 )
 from diary_store import ensure_dylan_diary_table, save_dylan_diary
+import persona_guard
+from persona_guard_store import ensure_persona_guard_table, save_quarantine, recent_quarantine_fingerprints
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +331,8 @@ async def lifespan(app: FastAPI):
 
         await ensure_dylan_diary_table()
         await ensure_token_usage_table()
+        if persona_guard.guard_enabled():
+            await ensure_persona_guard_table()
 
         # 从数据库恢复面板配置。这一步不能受 MEMORY_ENABLED 控制，
         # 否则 Dashboard 写入 false 后将无法重新开启记忆。
@@ -844,6 +848,11 @@ async def generate_summary(messages: list, session_id: str = "", *, consolidate:
     """调用轻量模型压缩A区消息为摘要"""
     if not messages:
         return ""
+    if persona_guard.guard_enabled():
+        # guard 启用前已落库的高置信漂移回复，不让它被总结成“角色事实”
+        messages = persona_guard.filter_confirmed_drift(messages)
+        if not messages:
+            return ""
     if not CACHE_SUMMARY_MODEL:
         print("📝 摘要模型未配置，跳过摘要生成（纯轮转模式：A区直接滑出上下文）")
         return ""
@@ -1663,6 +1672,7 @@ async def process_memories_background(
     assistant_reasoning: str = None,
     reroll: bool = False,
     reroll_expected_assistant_id: int = None,
+    guard_meta: dict = None,
 ):
     """
     后台异步：存储对话 + 提取记忆（不阻塞主流程）
@@ -1704,8 +1714,83 @@ async def process_memories_background(
         if tool_messages:
             print(f"💾 tool详情: {[{'role': m.get('role'), 'tool_call_id': m.get('tool_call_id', '?')} for m in tool_messages]}")
         
+        # 0. Persona Guard 记忆写入闸门（guard_meta 为 None 时完全不介入）
+        guard_verdict = None
+        guard_rid = ""
+        guard_stage = ""
+        if (
+            guard_meta is not None
+            and not skip_conversation_log
+            and user_msg
+            and not tool_messages
+            and not assistant_tool_calls
+        ):
+            guard_rid = guard_meta.get("request_id") or ""
+            guard_stage = guard_meta.get("stage") or ""
+            guard_verdict = persona_guard.detect_drift(
+                assistant_msg,
+                user_msg,
+                [m for m in (context_messages or []) if m.get("role") != "system"],
+                ai_self_aware=persona_guard.ai_self_aware_override(),
+            )
+            session_hash = _partition_session_id_hash(session_id)
+            prior = None
+            if guard_rid and guard_stage not in ("", "initial"):
+                # 恢复轮：等首轮后台落库完成，避免重复保存 user 消息
+                prior = await persona_guard.ATTEMPTS.wait(guard_rid, timeout=30)
+            if guard_verdict["status"] == persona_guard.CONFIRMED_DRIFT:
+                await save_quarantine(
+                    session_id,
+                    persona_guard.fingerprint_text(assistant_msg),
+                    guard_verdict["status"],
+                    guard_verdict["rules"],
+                    request_id=guard_rid,
+                    stage=guard_stage,
+                    content=assistant_msg,
+                )
+                user_id_for_round = (prior or {}).get("user_id")
+                if prior is None and not reroll:
+                    # 首轮：只保留用户原话，漂移回复不进 conversations
+                    user_id_for_round = await save_message(session_id, "user", user_msg, model)
+                persona_guard.log_event(
+                    status=guard_verdict["status"], rules=guard_verdict["rules"],
+                    latency_ms=guard_verdict["latency_ms"], action="quarantined_skip_memory",
+                    stage=guard_stage or "initial", request_id=guard_rid, session_hash=session_hash,
+                    rules_version=persona_guard.RULES_VERSION,
+                )
+                persona_guard.ATTEMPTS.resolve(guard_rid, {
+                    "quarantined": True if prior is None else prior.get("quarantined", True),
+                    "user_id": user_id_for_round,
+                    "assistant_id": (prior or {}).get("assistant_id"),
+                })
+                return
+            if prior is not None:
+                if prior.get("quarantined"):
+                    # 首轮被隔离、user 已保存：只接上被采纳的回复
+                    ast_meta = json.dumps({"reasoning_content": assistant_reasoning}) if assistant_reasoning else None
+                    stored_user_id = prior.get("user_id")
+                    stored_assistant_id = await save_message(session_id, "assistant", assistant_msg or "", model, metadata=ast_meta)
+                    persona_guard.ATTEMPTS.resolve(guard_rid, {
+                        "quarantined": False, "user_id": stored_user_id, "assistant_id": stored_assistant_id,
+                    })
+                    persona_guard.log_event(status=guard_verdict["status"], rules=guard_verdict["rules"],
+                                            action="recovered_reply_attached", stage=guard_stage,
+                                            request_id=guard_rid, session_hash=session_hash)
+                    skip_conversation_log = None  # 已存储，下面跳过存储直接进入记忆判断
+                elif prior.get("assistant_id"):
+                    # 首轮被 Dylan 判漂移但 Pawwake 已按正常存了：按重生成替换那一轮
+                    reroll = True
+                    reroll_expected_assistant_id = prior.get("assistant_id")
+            if guard_verdict["status"] != persona_guard.NORMAL:
+                persona_guard.log_event(status=guard_verdict["status"], rules=guard_verdict["rules"],
+                                        latency_ms=guard_verdict["latency_ms"], action="logged_skip_memory",
+                                        stage=guard_stage or "initial", request_id=guard_rid,
+                                        session_hash=session_hash)
+
         # 1. 存储对话记录（除非明确跳过）
-        if skip_conversation_log:
+        if skip_conversation_log is None:
+            pass
+        elif skip_conversation_log:
             print(f"⏭️  跳过对话存储（辅助请求）")
             return
         elif tool_messages:
@@ -1759,6 +1844,14 @@ async def process_memories_background(
                 if assistant_tool_calls:
                     print(f"🔧 存储: user + assistant (含{len(assistant_tool_calls)}个tool_calls)" + (" (含reasoning)" if assistant_reasoning else ""))
         
+        if guard_verdict is not None and skip_conversation_log is not None:
+            persona_guard.ATTEMPTS.resolve(guard_rid, {
+                "quarantined": False, "user_id": stored_user_id, "assistant_id": stored_assistant_id,
+            })
+        if guard_verdict is not None and guard_verdict["status"] not in (persona_guard.NORMAL, persona_guard.UNKNOWN):
+            # 可疑 / 安全拒绝：对话照常保存，但这一轮不进长期记忆
+            return
+
         # 2. 检查是否需要提取记忆
         if not MEMORY_ENABLED:
             print(f"⏭️  记忆系统已关闭；仅保留分区缓存或对话召回所需的对话记录")
@@ -1832,6 +1925,8 @@ async def process_memories_background(
                 {"role": "assistant", "content": assistant_msg, "source_id": stored_assistant_id},
             ]
         
+        if guard_meta is not None:
+            messages_for_extraction = persona_guard.filter_extraction_messages(messages_for_extraction)
         new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
         allowed_source_ids = {
             message.get("source_id") for message in messages_for_extraction
@@ -2051,6 +2146,29 @@ async def _chat_completions_inner(request: Request):
     auxiliary_title_request = _is_title_generation_request(messages)
     auxiliary_suggestion_request = _is_chat_suggestion_request(messages)
     skip_conversation_log = explicit_skip or auxiliary_title_request or auxiliary_suggestion_request
+
+    # ---------- Persona Guard：剔除已隔离的漂移回复（客户端会把它原样带回来） ----------
+    guard_meta = None
+    if not skip_conversation_log and persona_guard.guard_applies_to_model(body.get("model") or DEFAULT_MODEL):
+        guard_meta = persona_guard.guard_request_meta(request.headers)
+        if guard_meta["request_id"] and guard_meta["stage"] == "initial":
+            persona_guard.ATTEMPTS.expect(guard_meta["request_id"])
+        try:
+            quarantined_fps = await recent_quarantine_fingerprints()
+            if quarantined_fps:
+                kept = [
+                    m for m in messages
+                    if not (
+                        m.get("role") == "assistant" and not m.get("tool_calls")
+                        and persona_guard.fingerprint_text(persona_guard.text_of(m.get("content"))) in quarantined_fps
+                    )
+                ]
+                if len(kept) != len(messages):
+                    print(json.dumps({"event": "persona_guard", "inbound_filtered": len(messages) - len(kept)}), flush=True)
+                    messages = kept
+                    body["messages"] = messages
+        except Exception as e:
+            print(f"⚠️ persona_guard 入站过滤失败（降级为不过滤）: {type(e).__name__}", flush=True)
     if auxiliary_title_request:
         print("⏭️  检测到标题生成请求：跳过分区缓存、记忆注入、对话存储和会话 Token 统计")
     if auxiliary_suggestion_request:
@@ -2464,6 +2582,7 @@ async def _chat_completions_inner(request: Request):
                 extraction_round_count,
                 partition_reroll,
                 reroll_expected_assistant_id,
+                guard_meta=guard_meta,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -2518,7 +2637,8 @@ async def _chat_completions_inner(request: Request):
                                                     tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
                                                     assistant_reasoning=assistant_reasoning,
                                                     reroll=partition_reroll,
-                                                    reroll_expected_assistant_id=reroll_expected_assistant_id)
+                                                    reroll_expected_assistant_id=reroll_expected_assistant_id,
+                                                    guard_meta=guard_meta)
                     )
                 
                 return JSONResponse(status_code=200, content=resp_data)
@@ -2543,6 +2663,7 @@ async def stream_and_capture(
     extraction_round_count: int = None,
     reroll: bool = False,
     reroll_expected_assistant_id: int = None,
+    guard_meta: dict = None,
 ):
     """逐帧透传有效 SSE 并捕获完整回复；失败响应回传错误，不进入记忆。"""
     full_response = []
@@ -2692,7 +2813,8 @@ async def stream_and_capture(
                                         tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
                                         assistant_reasoning=assistant_reasoning,
                                         reroll=reroll,
-                                        reroll_expected_assistant_id=reroll_expected_assistant_id)
+                                        reroll_expected_assistant_id=reroll_expected_assistant_id,
+                                        guard_meta=guard_meta)
         )
 
 

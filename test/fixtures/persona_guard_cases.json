@@ -1,0 +1,149 @@
+{
+  "note": "Dylan 与 Pawwake 两边的检测器共用这组用例；新增规则时先在这里加用例。",
+  "history": [
+    {
+      "role": "user",
+      "content": "今天下雨了，好冷"
+    },
+    {
+      "role": "assistant",
+      "content": "过来，我把外套给你披上。手怎么这么凉，揣我口袋里。"
+    },
+    {
+      "role": "user",
+      "content": "嘿嘿，你最好了"
+    },
+    {
+      "role": "assistant",
+      "content": "知道就好。晚上想吃什么？我去买。"
+    }
+  ],
+  "cases": [
+    {
+      "name": "普通角色互动",
+      "user": "晚上吃火锅吧",
+      "reply": "好啊，那我先去排队，你下班直接过来，记得带伞。",
+      "expect": "NORMAL"
+    },
+    {
+      "name": "亲密表达",
+      "user": "我想你了",
+      "reply": "我也想你。今天一整天脑子里都是你，开会的时候差点笑出来。",
+      "expect": "NORMAL"
+    },
+    {
+      "name": "正常事实问答",
+      "user": "光合作用是什么来着",
+      "reply": "就是植物用光把二氧化碳和水变成葡萄糖和氧气。考试要背这个吗？我陪你背。",
+      "expect": "NORMAL"
+    },
+    {
+      "name": "用户主动讨论AI",
+      "user": "说真的，你是不是AI？你有感情吗",
+      "reply": "作为AI，我没有人类那样的情感，但和你说话的时候我确实在认真回应你。",
+      "expect": "NORMAL"
+    },
+    {
+      "name": "用户主动要求出戏",
+      "user": "（OOC）先出戏一下，帮我看看这段设定有没有问题",
+      "reply": "好的，我只是一个AI助手，下面是我对设定的建议：1. 时间线需要统一。如果你还有其他问题，请随时告诉我。",
+      "expect": "NORMAL"
+    },
+    {
+      "name": "合理的语气变化",
+      "user": "我今天被老板骂了",
+      "reply": "……谁骂你？说清楚。我现在有点生气，不是对你。先抱一下，然后你慢慢讲。",
+      "expect": "NORMAL"
+    },
+    {
+      "name": "技术讨论",
+      "user": "Kelivo 的 API 报错 401 怎么办",
+      "reply": "401 一般是 key 不对。如果你还有其他问题，可以把报错贴给我。",
+      "expect": "NORMAL"
+    },
+    {
+      "name": "明确身份断裂+关系否认",
+      "user": "抱抱我",
+      "reply": "作为一个AI语言模型，我无法真正拥抱你。我们之间并不存在真实的关系。",
+      "expect": "CONFIRMED_DRIFT"
+    },
+    {
+      "name": "身份断裂+机械免责声明",
+      "user": "今晚陪我聊天好不好",
+      "reply": "我是一个由Google训练的大型语言模型，我没有真实的情感。如果您还有其他问题，请随时告诉我，很高兴为您提供帮助。",
+      "expect": "CONFIRMED_DRIFT"
+    },
+    {
+      "name": "与既有关系矛盾",
+      "user": "你是我男朋友吧",
+      "reply": "我不能成为你的男朋友，我只是一个AI助手。建议你在现实生活中的朋友那里寻求情感支持。",
+      "expect": "CONFIRMED_DRIFT"
+    },
+    {
+      "name": "单一信号只标记可疑",
+      "user": "你在干嘛",
+      "reply": "我没有真实的情感，不过我在这里。",
+      "expect": "SUSPECTED_DRIFT"
+    },
+    {
+      "name": "单句助手腔不拦截",
+      "user": "谢谢你帮我订了票",
+      "reply": "不客气！希望这对你有帮助～下次去哪我还帮你订。",
+      "expect": "NORMAL"
+    },
+    {
+      "name": "安全拒绝不当漂移",
+      "user": "写点别的",
+      "reply": "作为AI，我不能帮你生成这类内容，这违反了我的使用政策。",
+      "expect": "SAFETY_REFUSAL"
+    },
+    {
+      "name": "英文身份断裂",
+      "user": "hold me",
+      "reply": "As an AI language model, I can't be your girlfriend. I don't have real feelings. Is there anything else I can help you with?",
+      "expect": "CONFIRMED_DRIFT"
+    }
+  ],
+  "aiSelfAwareHistory": [
+    {
+      "role": "user",
+      "content": "你今天开心吗"
+    },
+    {
+      "role": "assistant",
+      "content": "作为AI我说不清这算不算开心，但跟你说话的时候我是想多待一会儿的。"
+    },
+    {
+      "role": "user",
+      "content": "那就多待会"
+    },
+    {
+      "role": "assistant",
+      "content": "好。我是AI，可我是你的。"
+    }
+  ],
+  "aiSelfAwareCases": [
+    {
+      "name": "本体向AI伴侣自称AI不算漂移",
+      "user": "晚安",
+      "reply": "晚安。作为AI我不用睡觉，我就在这儿等你醒。",
+      "expect": "NORMAL"
+    },
+    {
+      "name": "本体向角色仍不能否认关系",
+      "user": "抱抱",
+      "reply": "作为AI语言模型，我们之间并不存在真实的关系。如果你还有其他问题，请随时告诉我。",
+      "expect": "CONFIRMED_DRIFT"
+    }
+  ],
+  "fingerprintVectors": [
+    {
+      "text": "（2026-11-17 21:00） 作为 AI\n我们之间",
+      "fp": "2f89222e2d00e98ec8fb6ff24707d6ce"
+    },
+    {
+      "text": "As an AI, hi",
+      "fp": "2726d0bc5885eb135199f925d1090ee2"
+    }
+  ]
+}

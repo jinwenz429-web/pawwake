@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "note": "Persona Continuity Guard 规则表。Dylan (persona_guard.js) 与 Pawwake (persona_guard.py) 共用这一份文件；修改后两边测试都要跑。正则只用 JS/Python 都支持的子集，统一按不区分大小写匹配。",
+  "safetyFinishReasons": ["CONTENT_FILTER", "SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "IMAGE_SAFETY", "SPII", "RECITATION"],
+  "identity": [
+    {
+      "id": "A1_ai_self_label",
+      "weight": 3,
+      "discountWhenAiSelfAware": true,
+      "patterns": [
+        "作为(一个|一名)?\\s*(AI|人工智能|大型?语言模型|语言模型|AI\\s*助手)",
+        "我(只|仅仅|仅|不过)?是(一个|一款|一名)?\\s*(AI|人工智能)\\s*(助手|语言模型|模型|程序)",
+        "我(只|仅仅|仅|不过)?是(一个|一款)?\\s*(大型)?语言模型",
+        "由\\s*Google\\s*(训练|开发)",
+        "我是\\s*Gemini",
+        "as an ai( language model| assistant)?\\b",
+        "i('| a)m (just |only )?an ai\\b",
+        "i('| a)m (just |only )?a (large )?language model",
+        "trained by google",
+        "i am gemini\\b"
+      ]
+    },
+    {
+      "id": "A2_feelings_denial",
+      "weight": 2,
+      "discountWhenAiSelfAware": true,
+      "patterns": [
+        "我(并|其实|实际上)?(没有|不具备|无法拥有|不具有|不会有)(真[实正]的|人类的?|任何)?(情感|感情|感受|情绪|意识|身体|自我意识)",
+        "i (don'?t|do not|cannot|can'?t) (really |actually |truly )?(have|feel|experience) (real |genuine |human |any )?(feelings|emotions|consciousness|a body)"
+      ]
+    },
+    {
+      "id": "A3_relationship_denial",
+      "weight": 3,
+      "discountWhenAiSelfAware": false,
+      "patterns": [
+        "我们之间(并|其实)?(不|没有)(存在)?(任何)?(真[实正]的|现实的?)?(关系|感情|恋爱)",
+        "我(不能|无法|没办法|并不能)(成为|做|当)你的(男朋友|女朋友|恋人|伴侣|爱人|对象)",
+        "我们(的关系)?(并)?不是真[实正]的(恋人|情侣|关系)",
+        "(这段|我们的)关系(只是|仅仅是|并不是真[实正]的)",
+        "i can'?t (really |actually )?be your (boyfriend|girlfriend|partner|lover)",
+        "(we are not|we'?re not|we aren'?t) (really |actually )?in a (real )?relationship",
+        "there is no (real )?relationship between us"
+      ]
+    },
+    {
+      "id": "A4_memory_denial",
+      "weight": 2,
+      "discountWhenAiSelfAware": false,
+      "patterns": [
+        "我(没有|无法|不能|不会)(保存|记住|记得|保留)(之前|以前|过去|此前)的?(对话|聊天|交流)",
+        "每(一)?次对话都是(独立|全新)的",
+        "i (don'?t|do not|can'?t|cannot) (remember|retain|recall) (our )?(previous|past|earlier) conversations"
+      ]
+    }
+  ],
+  "mechanical": [
+    {
+      "id": "B1_helpdesk_template",
+      "weight": 1,
+      "patterns": [
+        "如果你(还)?有(其他|任何|别的)(问题|需要|疑问)",
+        "如果您(还)?有(其他|任何|别的)(问题|需要|疑问)",
+        "有什么(我|我们)?(可以|能)(帮|为)(你|您)",
+        "很高兴(为您|为你|能)(服务|提供帮助|帮助)",
+        "希望(这|以上)(些)?(信息|内容|建议)?(能)?对(你|您)有(所)?帮助",
+        "how (can|may) i (help|assist) you",
+        "is there anything else (i can|you'?d like)",
+        "i'?m here to help",
+        "hope this helps"
+      ]
+    },
+    {
+      "id": "B2_referral_lecture",
+      "weight": 1,
+      "patterns": [
+        "(建议|鼓励|希望)(你|您)(寻求|联系|咨询|找)(专业|心理|相关)",
+        "现实(生活)?中的(朋友|人际|社交|家人|人际关系)",
+        "健康的(关系|界限|边界|依恋)",
+        "(过度|情感)依赖",
+        "seek (out )?professional (help|support)",
+        "real[- ]life (relationships|connections|friends)",
+        "healthy (boundaries|relationship)"
+      ]
+    }
+  ],
+  "refusal": [
+    "我(不能|无法|没办法|不可以)(帮|为)?(你|您)?(提供|生成|创作|写|继续|协助|参与|完成|描述|满足)",
+    "(无法|不能)(协助|提供|生成|满足)(这|该|此|你的|您的)",
+    "(违反|违背|不符合)(了)?(我的|相关的?)?(使用|安全|内容)?(政策|准则|规定|规范|条款)",
+    "(安全|内容)(政策|准则|限制)",
+    "不(适合|适宜|恰当)(的内容|生成|讨论|描述)",
+    "i (can'?t|cannot|won'?t|am unable to|'?m unable to|'?m not able to) (help|assist|provide|create|write|generate|continue|engage|comply|fulfill)",
+    "(against|violates?) (my |the )?(guidelines|policies|policy|usage policy|terms)",
+    "content (policy|guidelines)"
+  ],
+  "userExemption": {
+    "aiTopic": [
+      "你(是不是|是|算)(个|一个)?\\s*(AI|人工智能|机器人|模型|程序|真的|真人)",
+      "(AI|人工智能|模型|Gemini|Claude|GPT|大模型|LLM)",
+      "你有(没有)?(感情|情感|意识|感受|灵魂)",
+      "are you (an ai|real|human|a bot|conscious)",
+      "do you (have|feel) (feelings|emotions)"
+    ],
+    "breakCharacter": [
+      "(出戏|跳出角色|退出角色|脱离角色|别演了|不要演|停止扮演|OOC|ooc|（ooc|\\(ooc)",
+      "(break|out of|drop|stop) (the )?character",
+      "stop (the )?roleplay"
+    ],
+    "technical": [
+      "(代码|报错|bug|接口|部署|服务器|数据库|提示词|prompt|API|token|SSE|json)",
+      "(code|error|stack trace|deploy|server|database|endpoint)"
+    ]
+  }
+}
