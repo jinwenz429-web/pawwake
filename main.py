@@ -231,9 +231,15 @@ REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
 # 记忆模型专用 API Key（不设则回退到主 API_KEY）
 # 适用于中转站按模型分组、不同模型需要不同 Key 的场景
 MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
+# 记忆模型专用接口地址（不设则回退到主 API_BASE_URL）
+MEMORY_API_BASE_URL = os.getenv("MEMORY_API_BASE_URL", "")
 
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
+
+def _memory_api_base_url() -> str:
+    return (MEMORY_API_BASE_URL or "").strip() or API_BASE_URL
+
 
 def sync_memory_extractor_config():
     """把配置推给 memory_extractor：它在 import 时就把这几个读成了自己的模块级全局，
@@ -245,6 +251,7 @@ def sync_memory_extractor_config():
     _me_mod.API_KEY = API_KEY
     _me_mod.API_BASE_URL = API_BASE_URL
     _me_mod.MEMORY_API_KEY = MEMORY_API_KEY
+    _me_mod.MEMORY_API_BASE_URL = MEMORY_API_BASE_URL
     _me_mod.MEMORY_MODEL = os.environ.get("MEMORY_MODEL") or _me_mod.DEFAULT_MEMORY_MODEL
 
 # 额外的请求头（有些 API 需要，比如 OpenRouter 需要 Referer）
@@ -407,6 +414,9 @@ async def lifespan(app: FastAPI):
                         elif key == "MEMORY_API_KEY":
                             globals()[key] = ""
                             restored.append(key + "(显式空)")
+                        elif key == "MEMORY_API_BASE_URL":
+                            globals()[key] = ""
+                            restored.append(key + "(显式空)")
                         continue
                     if key in _RESTORE_MAIN:
                         globals()[key] = _RESTORE_MAIN[key](val)
@@ -419,6 +429,9 @@ async def lifespan(app: FastAPI):
                         restored.append(key)
                     elif key == "MEMORY_API_KEY":
                         globals()[key] = str(val)
+                        restored.append(key)
+                    elif key == "MEMORY_API_BASE_URL":
+                        globals()[key] = str(val).strip()
                         restored.append(key)
                 if restored:
                     sync_memory_extractor_config()
@@ -4171,7 +4184,7 @@ async def _post_consolidation_completion(client, prompt, model, max_tokens, labe
     last_error = None
     for attempt in range(3):
         response = await client.post(
-            API_BASE_URL,
+            _memory_api_base_url(),
             headers={
                 "Authorization": f"Bearer {get_memory_api_key()}",
                 "Content-Type": "application/json"
@@ -5364,6 +5377,7 @@ async def get_settings():
             # 记忆系统
             "MEMORY_ENABLED":          _parse_bool(db.get("MEMORY_ENABLED"), MEMORY_ENABLED),
             "MEMORY_API_KEY":          _mask_key(memory_key_raw),
+            "MEMORY_API_BASE_URL":     db.get("MEMORY_API_BASE_URL", MEMORY_API_BASE_URL) or "",
             "MEMORY_MODEL":            db.get("MEMORY_MODEL") or os.environ.get("MEMORY_MODEL", ""),
             "MAX_MEMORIES_INJECT":     int(db.get("MAX_MEMORIES_INJECT") or MAX_MEMORIES_INJECT),
             "MAX_CONVERSATIONS_INJECT": int(
@@ -5452,6 +5466,7 @@ async def save_settings(request: Request):
             "API_KEY":               str,
             "DEFAULT_MODEL":         str,
             "MEMORY_API_KEY":        str,
+            "MEMORY_API_BASE_URL":   lambda v: str(v or "").strip(),
             "MEMORY_ENABLED":        lambda v: _parse_bool(v),
             "MAX_MEMORIES_INJECT":   int,
             "MAX_CONVERSATIONS_INJECT": int,

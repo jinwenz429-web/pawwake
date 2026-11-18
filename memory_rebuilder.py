@@ -115,7 +115,7 @@ async def _post_json_array(prompt: str, label: str, max_tokens: int = None):
         try:
             async with httpx.AsyncClient(timeout=180.0) as client:
                 response = await client.post(
-                    _me.API_BASE_URL,
+                    _me.get_memory_api_base_url(),
                     headers={
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
