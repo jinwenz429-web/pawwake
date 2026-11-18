@@ -284,3 +284,91 @@ class ToolRoundTripTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProactiveToolCallPartitionTests(unittest.IsolatedAsyncioTestCase):
+    """Kelivo 醒来时先调 search_memory：分区模式下工具结果不能被网关丢掉。"""
+
+    async def test_proactive_tool_round_keeps_the_tool_result(self):
+        import companion_turns
+
+        rows = []
+        upstream_bodies = []
+        background = []
+        real_create_task = asyncio.create_task
+
+        def track(coro):
+            task = real_create_task(coro)
+            background.append(task)
+            return task
+
+        async def save_message(session_id, role, content, model, metadata=None):
+            rows.append({"id": len(rows) + 1, "role": role, "content": content,
+                         "metadata": metadata, "created_at": datetime(2026, 11, 19, 1, 0)})
+            return len(rows)
+
+        async def history(session_id, limit=100):
+            return [dict(row) for row in rows]
+
+        replies = [
+            completion({"role": "assistant", "content": None, "tool_calls": [TOOL_CALL]}),
+            completion({"role": "assistant", "content": "早，想起你说想去京都了。"}),
+        ]
+
+        def upstream(request):
+            upstream_bodies.append(json.loads(request.content))
+            return httpx.Response(200, json=replies.pop(0))
+
+        cue = companion_turns.PROACTIVE_CUE_OPENING + "\n[醒来] 现在是 2026年11月19日 星期四 09:10。"
+        rows.extend([
+            {"id": 1, "role": "user", "content": "晚安", "metadata": None,
+             "created_at": datetime(2026, 11, 18, 15, 0)},
+            {"id": 2, "role": "assistant", "content": "晚安～", "metadata": None,
+             "created_at": datetime(2026, 11, 18, 15, 0)},
+        ])
+        stack = ExitStack()
+        for name, value in {
+            "CACHE_PARTITION_ENABLED": True, "MEMORY_ENABLED": False,
+            "MEMORY_EXTRACT_ENABLED": False, "FORCE_STREAM": False, "REASONING_EFFORT": "",
+        }.items():
+            stack.enter_context(patch.object(main, name, value))
+        stack.enter_context(patch.object(main, "get_system_prompt", AsyncMock(return_value="persona")))
+        stack.enter_context(patch.object(main, "conversation_persistence_enabled", return_value=True))
+        stack.enter_context(patch.object(main, "save_message", save_message))
+        stack.enter_context(patch.object(main, "get_conversation_messages", history))
+        stack.enter_context(patch.object(main, "get_session_cache_state",
+                                         AsyncMock(return_value={"summary_parts": [], "a_start_round": 0,
+                                                                 "seen_fragment_ids": []})))
+        stack.enter_context(patch.object(main, "compact_summary_parts", AsyncMock(return_value=None)))
+        stack.enter_context(patch.object(main, "recent_diaries", AsyncMock(return_value=[])))
+        stack.enter_context(patch.object(main, "save_dylan_diary", AsyncMock()))
+        stack.enter_context(patch.object(persona_guard, "guard_applies_to_model", return_value=False))
+        stack.enter_context(patch.object(main, "recent_quarantine_fingerprints", AsyncMock(return_value=set())))
+        stack.enter_context(patch.object(main.asyncio, "create_task", track))
+        stack.enter_context(patch.object(main.httpx, "AsyncClient", lambda **kwargs: REAL_ASYNC_CLIENT(
+            transport=httpx.MockTransport(upstream), **kwargs)))
+        stack.enter_context(redirect_stdout(io.StringIO()))
+
+        history_msgs = [{"role": "user", "content": "晚安"}, {"role": "assistant", "content": "晚安～"}]
+        with stack:
+            await main._chat_completions_inner(FakeRequest(history_msgs + [{"role": "user", "content": cue}], TOOLS))
+            await asyncio.gather(*background)
+            # 工具调用存档了，隐藏提示没存
+            self.assertEqual([row["role"] for row in rows], ["user", "assistant", "assistant"])
+            self.assertIn("tool_calls", rows[-1]["metadata"])
+            self.assertFalse(any(companion_turns.PROACTIVE_CUE_OPENING in (row["content"] or "") for row in rows))
+
+            tool_result = "- [记于 2026-10-01｜49 天前｜计划] 她说想 2027 年春天去京都看樱花"
+            response = await main._chat_completions_inner(FakeRequest(history_msgs + [
+                {"role": "user", "content": cue},
+                {"role": "assistant", "content": None, "tool_calls": [TOOL_CALL]},
+                {"role": "tool", "tool_call_id": "call_1", "name": "search_memory", "content": tool_result},
+            ], TOOLS))
+            await asyncio.gather(*background)
+
+        self.assertEqual(response.status_code, 200)
+        sent = upstream_bodies[1]["messages"]
+        self.assertTrue(any(m.get("role") == "tool" and tool_result in str(m.get("content")) for m in sent))
+        self.assertEqual([row["role"] for row in rows],
+                         ["user", "assistant", "assistant", "tool", "assistant"])
+        self.assertEqual(rows[-1]["content"], "早，想起你说想去京都了。")
