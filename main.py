@@ -1924,8 +1924,15 @@ async def store_proactive_reply(
     model: str,
     assistant_reasoning: str = None,
     persist_conversation: bool = True,
+    tool_messages: list = None,
+    assistant_tool_calls: list = None,
 ):
-    """Kelivo 主动回合：日记进日记表，回复本身只存助手这一条；静默就什么都不存。"""
+    """Kelivo 主动回合：日记进日记表，回复本身只存助手这一条；静默就什么都不存。
+
+    醒来时模型也可能先调工具（比如 search_memory）：工具调用和工具结果照常存档，
+    否则分区模式下一个请求会以为库里没有在等工具结果，把客户端送来的结果丢掉。
+    隐藏提示本身仍然不存，也不做记忆提取。
+    """
     rest, diaries = companion_turns.split_diary(assistant_msg or "")
     for body in diaries:
         try:
@@ -1938,6 +1945,21 @@ async def store_proactive_reply(
     if diaries:
         print(f"📔 主动回合写了 {len(diaries)} 篇日记", flush=True)
     if not persist_conversation:
+        return
+    for tool_message in [tm for tm in (tool_messages or []) if tm.get("content")]:
+        meta_dict = {}
+        if tool_message.get("tool_call_id"):
+            meta_dict["tool_call_id"] = tool_message["tool_call_id"]
+        if tool_message.get("name"):
+            meta_dict["name"] = tool_message["name"]
+        await save_message(session_id, "tool", tool_message.get("content", ""), model,
+                           metadata=json.dumps(meta_dict) if meta_dict else None)
+    if assistant_tool_calls:
+        meta_dict = {"tool_calls": assistant_tool_calls}
+        if assistant_reasoning:
+            meta_dict["reasoning_content"] = assistant_reasoning
+        await save_message(session_id, "assistant", rest or "", model, metadata=json.dumps(meta_dict))
+        print(f"🔧 主动回合调用了 {len(assistant_tool_calls)} 个工具，已存档等待结果", flush=True)
         return
     if not rest or companion_turns.is_silence(rest):
         print("🤫 主动回合选择静默，不存对话", flush=True)
@@ -3234,6 +3256,8 @@ async def _chat_completions_inner(request: Request):
                     asyncio.create_task(store_proactive_reply(
                         session_id, assistant_msg, model, assistant_reasoning,
                         persist_conversation=conversation_persistence_enabled(),
+                        tool_messages=tool_messages,
+                        assistant_tool_calls=assistant_tool_calls,
                     ))
                 elif conversation_persistence_enabled() and (user_message or tool_messages):
                     asyncio.create_task(
@@ -3471,6 +3495,8 @@ async def stream_and_capture(
         asyncio.create_task(store_proactive_reply(
             session_id, assistant_msg, model, assistant_reasoning,
             persist_conversation=conversation_persistence_enabled(),
+            tool_messages=tool_messages,
+            assistant_tool_calls=assistant_tool_calls,
         ))
     elif stream_succeeded and conversation_persistence_enabled() and (user_message or tool_messages):
         asyncio.create_task(
