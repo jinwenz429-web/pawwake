@@ -163,6 +163,94 @@ class RealDatabaseTests(unittest.IsolatedAsyncioTestCase):
                                       saved["memory_id"])
         self.assertEqual((row["kind"], row["valid_until"]), ("state", date(2026, 12, 2)))
 
+    async def _rebuild_plan(self, mode):
+        import memory_rebuilder as rebuilder
+        async with self.pool.acquire() as conn:
+            target = await conn.fetchval(
+                "INSERT INTO memories (content, importance, layer, kind) "
+                "VALUES ('她喜欢喝咖啡', 6, 3, 'fact') RETURNING id")
+            frag = await conn.fetchval(
+                "INSERT INTO memories (content, importance, layer, kind) "
+                "VALUES ('2026-11-18 她说最近改喝茶了', 5, 1, 'fact') RETURNING id")
+            frag2 = await conn.fetchval(
+                "INSERT INTO memories (content, importance, layer, kind, valid_until) "
+                "VALUES ('截至 2026-11-18 在赶论文', 5, 1, 'state', '2026-12-02') RETURNING id")
+        await rebuilder.ensure_rebuild_table()
+        sources = [{"id": frag, "content": "2026-11-18 她说最近改喝茶了"},
+                   {"id": frag2, "content": "截至 2026-11-18 在赶论文"}]
+        actions = [
+            {"action": "UPDATE", "source_ids": [frag], "target_id": target, "target_layer": 3,
+             "title": "饮品", "content": "以前喜欢咖啡，2026-11 起改喝茶", "importance": 6,
+             "reason": "", "target_hash": rebuilder._content_hash("她喜欢喝咖啡"),
+             "target_content": "她喜欢喝咖啡"},
+            {"action": "KEEP", "source_ids": [frag2], "target_layer": 1, "title": "论文",
+             "content": "", "importance": 7, "reason": ""},
+        ]
+        plan_id, _ = await rebuilder._save_plan(sources, actions)
+        with patch.object(database, "MEMORY_UPDATE_MODE", mode), redirect_stdout(io.StringIO()):
+            result = await rebuilder.apply_memory_rebuild_plan(plan_id, plan_id)
+        return rebuilder, target, frag, frag2, result
+
+    async def test_rebuild_update_in_apply_mode(self):
+        rebuilder, target, frag, frag2, result = await self._rebuild_plan("apply")
+        self.assertEqual((result["superseded"], result["created"], result["kept"]), (1, 1, 1))
+        self.assertFalse(await self.active(target))
+        self.assertFalse(await self.active(frag))
+        async with self.pool.acquire() as conn:
+            new = await conn.fetchrow("SELECT * FROM memories WHERE id = $1", result["created_ids"][0])
+            kept = await conn.fetchrow("SELECT * FROM memories WHERE id = $1", frag2)
+        self.assertEqual((new["kind"], new["merged_from"]), ("fact", [frag]))
+        self.assertEqual((kept["content"], kept["importance"], kept["title"]),
+                         ("截至 2026-11-18 在赶论文", 7, "论文"))
+        self.assertEqual(await rebuilder._load_active_memories(), [])
+
+    async def test_rebuild_update_in_observe_mode_then_accept(self):
+        rebuilder, target, frag, frag2, result = await self._rebuild_plan("observe")
+        self.assertEqual((result["proposals"], result["created"]), (1, 0))
+        self.assertTrue(await self.active(target))
+        self.assertTrue(await self.active(frag))
+        self.assertEqual(await rebuilder._load_active_memories(), [])  # 碎片已被处理过
+        items, _ = await database.list_update_proposals("pending")
+        self.assertIsNone(items[0]["new_memory_id"])
+        accepted = await database.resolve_update_proposal(items[0]["id"], accept=True)
+        self.assertFalse(await self.active(target))
+        self.assertFalse(await self.active(frag))
+        async with self.pool.acquire() as conn:
+            new = await conn.fetchrow("SELECT * FROM memories WHERE id = $1", accepted["created_id"])
+        self.assertEqual((new["content"], new["layer"], new["merged_from"]),
+                         ("以前喜欢咖啡，2026-11 起改喝茶", 3, [frag]))
+
+    async def test_fix_plan_apply_and_revert(self):
+        import memory_fix
+        from datetime import datetime, timezone
+        async with self.pool.acquire() as conn:
+            memory_id = await conn.fetchval(
+                "INSERT INTO memories (content, created_at) VALUES ('昨天和妈妈吵架', $1) RETURNING id",
+                datetime(2026, 11, 18, 4, 0, tzinfo=timezone.utc))
+        await memory_fix.ensure_fix_tables()
+        sources = await memory_fix._load_candidates("time")
+        self.assertEqual([item["id"] for item in sources], [memory_id])
+        items = memory_fix.build_plan_items("time", sources, [
+            {"id": memory_id, "content": "2026-11-17 和妈妈吵架", "kind": "event",
+             "event_date": "2026-11-17"}])
+        async with self.pool.acquire() as conn:
+            plan_id = await conn.fetchval(
+                "INSERT INTO memory_fix_plans (mode, items) VALUES ('time', $1::jsonb) RETURNING id",
+                memory_fix._json_text(items))
+        result = await memory_fix.apply_fix_plan(plan_id, plan_id)
+        self.assertEqual(result["applied"], 1)
+        plan = await memory_fix.get_fix_plan(plan_id)
+        self.assertEqual(plan["status"], "applied")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT content, kind, event_date FROM memories WHERE id = $1", memory_id)
+        self.assertEqual((row["content"], row["kind"], str(row["event_date"])),
+                         ("2026-11-17 和妈妈吵架", "event", "2026-11-17"))
+        reverted = await memory_fix.revert_fix_plan(plan_id)
+        self.assertEqual(reverted["reverted"], 1)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT content, kind FROM memories WHERE id = $1", memory_id)
+        self.assertEqual((row["content"], row["kind"]), ("昨天和妈妈吵架", None))
+
 
 if __name__ == "__main__":
     unittest.main()
