@@ -19,6 +19,10 @@
                     <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg></span>
                     <span class="nav-label">记忆管理</span>
                 </a>
+                <a href="#" class="nav-item" data-section="proposals">
+                    <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></span>
+                    <span class="nav-label">记忆更新提议 <span id="proposal-badge" style="display:none;"></span></span>
+                </a>
                 <a href="#" class="nav-item" data-section="import">
                     <span class="nav-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg></span>
                     <span class="nav-label">导入记忆</span>
@@ -412,6 +416,28 @@
             </section>
 
             <!-- 对话线管理 Section -->
+            <section id="section-proposals" class="section">
+                <div class="section-header">
+                    <h1>记忆更新提议</h1>
+                    <p class="section-desc">提取模型认为「新记忆取代了旧记忆」的地方。observe 模式下旧记忆不动，在这里逐条看：采纳 = 归档旧记忆（可在已归档里恢复），忽略 = 两条都留着。</p>
+                </div>
+                <div class="card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px; flex-wrap: wrap;">
+                        <span id="proposal-summary" style="color: var(--text-muted);"></span>
+                        <div style="display: flex; gap: 8px;">
+                            <select id="proposal-status" class="input" style="width: auto;" onchange="loadProposals()">
+                                <option value="pending">待处理</option>
+                                <option value="accepted">已采纳</option>
+                                <option value="ignored">已忽略</option>
+                                <option value="all">全部</option>
+                            </select>
+                            <button class="btn btn-sm" onclick="loadProposals()">刷新</button>
+                        </div>
+                    </div>
+                    <div id="proposal-list" style="color: var(--text-muted);">加载中...</div>
+                </div>
+            </section>
+
             <section id="section-diaries" class="section">
                 <div class="section-header">
                     <h1>它的日记</h1>
@@ -559,6 +585,19 @@
                         <label class="toggle"><input type="checkbox" id="set-MEMORY_MCP_WRITE_ENABLED"><span class="toggle-slider"></span></label>
                     </div>
                     <small class="form-hint" style="display:block;margin:-6px 0 10px;">开启后多出 remember / update_memory 两个工具，写入走和自动提取一样的去重，来源记为 mcp。默认关</small>
+                    <div class="settings-field">
+                        <label>提取时对比的相关记忆数 (MEMORY_EXTRACT_CONTEXT_LIMIT)</label>
+                        <input type="number" id="set-MEMORY_EXTRACT_CONTEXT_LIMIT" class="input" min="0" max="100">
+                        <small class="form-hint">提取前拿这段对话去检索最相关的 N 条已有记忆给模型对比，另外固定补上核心记忆（最多 15 条）。默认 30</small>
+                    </div>
+                    <div class="settings-field">
+                        <label>更新旧记忆的方式 (MEMORY_UPDATE_MODE)</label>
+                        <select id="set-MEMORY_UPDATE_MODE" class="input">
+                            <option value="observe">observe：只记提议，旧记忆不动（默认）</option>
+                            <option value="apply">apply：直接归档旧记忆</option>
+                        </select>
+                        <small class="form-hint">模型判断「这条是对旧记忆的更新」时怎么处理。observe 下新旧都留着，在「记忆更新提议」页逐条采纳或忽略</small>
+                    </div>
                     <div class="settings-field">
                         <label>临时状态有效天数 (MEMORY_STATE_TTL_DAYS)</label>
                         <input type="number" id="set-MEMORY_STATE_TTL_DAYS" class="input" min="1" max="365">

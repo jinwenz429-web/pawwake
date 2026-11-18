@@ -62,6 +62,16 @@ MEMORY_HW_IMPORTANCE = float(os.getenv("MEMORY_HW_IMPORTANCE", "0.15"))
 MEMORY_HW_RECENCY = float(os.getenv("MEMORY_HW_RECENCY", "0.15"))
 MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.5"))
 
+# 「更新旧记忆」怎么落地：observe = 只记提议、不动旧条（默认）；apply = 直接归档旧条
+MEMORY_UPDATE_MODE = os.getenv("MEMORY_UPDATE_MODE", "observe").strip().lower()
+if MEMORY_UPDATE_MODE not in ("observe", "apply"):
+    MEMORY_UPDATE_MODE = "observe"
+
+
+def current_update_mode() -> str:
+    return "apply" if str(MEMORY_UPDATE_MODE).strip().lower() == "apply" else "observe"
+
+
 # state 类记忆的有效期：记录日 + N 天（plan 固定是 event_date + 3 天）
 MEMORY_STATE_TTL_DAYS = int(os.getenv("MEMORY_STATE_TTL_DAYS", "14"))
 PLAN_GRACE_DAYS = 3
@@ -292,6 +302,25 @@ async def init_tables():
         await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT NULL")
         await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_until DATE DEFAULT NULL")
         await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by INTEGER DEFAULT NULL")
+
+        # 「用新记忆取代旧记忆」的提议（MEMORY_UPDATE_MODE=observe 时只记在这里，等人工采纳）
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_update_proposals (
+                id              BIGSERIAL PRIMARY KEY,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                new_memory_id   INTEGER NOT NULL,
+                old_memory_id   INTEGER NOT NULL,
+                new_content     TEXT,
+                old_content     TEXT,
+                source          TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                resolved_at     TIMESTAMPTZ DEFAULT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_update_proposals_status
+            ON memory_update_proposals (status, id)
+        """)
 
         # 三层记忆索引
         await conn.execute("""
@@ -1655,14 +1684,91 @@ async def get_memory_by_id(memory_id: int):
         return dict(row) if row else None
 
 
+def plan_dedup_write(clean_content: str, rows: list, threshold: float,
+                     target_row: dict = None) -> dict:
+    """判重决策（纯函数，便于测试）。
+
+    返回 {"op": "skip" | "update_in_place" | "insert", "matched": row|None,
+          "reason": str|None, "similarity": float|None, "supersede": row|None}
+
+    - target_row：模型给了 action=update 且目标合法。这时以模型为准：
+      不再拿旧条做字面比对（包括否定词那条判断），只要新内容不是别处已有的原话，就新建并取代旧条。
+    - 没有 target 时，新内容比 layer 2/3 的旧条更完整（containment_update）
+      也按「更新」处理，而不是丢掉新信息。
+    """
+    target_id = int(target_row["id"]) if target_row else None
+    matched = None
+    for row in rows:
+        if target_id is not None and int(row["id"]) == target_id:
+            continue
+        reason, similarity = _memory_duplicate_relation(clean_content, row["content"] or "", threshold)
+        if reason:
+            matched = (row, reason, similarity)
+            break
+
+    if target_row is not None:
+        if matched and matched[1] == "exact":
+            row, reason, similarity = matched
+            return {"op": "skip", "matched": row, "reason": reason,
+                    "similarity": similarity, "supersede": None}
+        return {"op": "insert", "matched": None, "reason": "model_update",
+                "similarity": None, "supersede": target_row}
+
+    if not matched:
+        return {"op": "insert", "matched": None, "reason": None,
+                "similarity": None, "supersede": None}
+
+    row, reason, similarity = matched
+    layer = int(row["layer"] or 1)
+    if reason == "containment_update":
+        if layer == 1 and _is_materially_richer_memory(clean_content, row["content"] or ""):
+            return {"op": "update_in_place", "matched": row, "reason": reason,
+                    "similarity": similarity, "supersede": None}
+        if layer in (2, 3):
+            return {"op": "insert", "matched": row, "reason": reason,
+                    "similarity": similarity, "supersede": row}
+    return {"op": "skip", "matched": row, "reason": reason,
+            "similarity": similarity, "supersede": None}
+
+
+async def _record_supersede(conn, new_id: int, old_row: dict, new_content: str,
+                            mode: str, source: str) -> dict:
+    """新条已经插入后，按模式处理旧条：apply 直接归档，observe 只记一条提议。"""
+    old_id = int(old_row["id"])
+    if mode == "apply":
+        await conn.execute(
+            """UPDATE memories SET is_active = FALSE, superseded_by = $1
+               WHERE id = $2 AND is_active = TRUE""",
+            new_id, old_id,
+        )
+        print(f"🔁 记忆 #{new_id} 取代了 #{old_id}（apply 模式，旧条已归档）", flush=True)
+        return {"supersedes": old_id, "update_mode": "apply", "proposal_id": None}
+    proposal_id = await conn.fetchval(
+        """INSERT INTO memory_update_proposals
+           (new_memory_id, old_memory_id, new_content, old_content, source)
+           VALUES ($1, $2, $3, $4, $5) RETURNING id""",
+        new_id, old_id, new_content, old_row.get("content"),
+        source,
+    )
+    print(f"📝 打算用 #{new_id} 取代 #{old_id}（observe 模式，只记提议 #{proposal_id}）", flush=True)
+    return {"supersedes": old_id, "update_mode": "observe", "proposal_id": proposal_id}
+
+
 async def save_memory_deduplicated(content: str, importance: int = 5,
                                    source_session: str = "",
                                    threshold: float = DEFAULT_MEMORY_DEDUP_THRESHOLD,
                                    source_message_ids: list = None,
                                    kind: str = None,
                                    event_date: date = None,
-                                   valid_until: date = None) -> dict:
-    """自动提取专用的原子判重写入。kind / event_date / valid_until 只在新插入时写入。"""
+                                   valid_until: date = None,
+                                   supersede_target_id: int = None,
+                                   update_mode: str = None) -> dict:
+    """自动提取 / MCP 写入共用的原子判重写入。
+
+    kind / event_date / valid_until 只在新插入时写入。
+    supersede_target_id：模型说这条是对某条旧记忆的更新（调用方已确认它在给模型看的那批里）；
+    按 update_mode（默认取 MEMORY_UPDATE_MODE）处理旧条。
+    """
     clean_content = str(content or "").strip()
     if not clean_content:
         return {
@@ -1672,6 +1778,7 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
             "matched_id": None,
             "similarity": None,
         }
+    mode = update_mode or current_update_mode()
 
     new_keywords = sorted(
         set(extract_search_keywords(clean_content)),
@@ -1703,6 +1810,17 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                         "action": "skipped", "reason": "invalid_source",
                         "memory_id": None, "matched_id": None, "similarity": None,
                     }
+
+            target_row = None
+            if supersede_target_id is not None:
+                target_row = await conn.fetchrow(
+                    """SELECT id, content, importance, layer FROM memories
+                       WHERE id = $1 AND is_active = TRUE AND superseded_by IS NULL""",
+                    int(supersede_target_id),
+                )
+                if target_row is None:
+                    print(f"ℹ️ 要取代的 #{supersede_target_id} 已不在活跃记忆里，按新记忆处理", flush=True)
+
             if new_keywords:
                 where_parts = [
                     f"content ILIKE '%' || ${index + 1} || '%'"
@@ -1725,55 +1843,39 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                     ORDER BY layer DESC, id DESC
                 """)
 
-            matched = None
-            for row in rows:
-                reason, similarity = _memory_duplicate_relation(
+            decision = plan_dedup_write(clean_content, rows, threshold, target_row)
+            matched = decision["matched"]
+            matched_id = int(matched["id"]) if matched else None
+
+            if decision["op"] == "update_in_place":
+                embedding_column = "embedding" if HAS_PGVECTOR else "embedding_json"
+                await conn.execute(
+                    f"""UPDATE memories
+                        SET content = $1,
+                            importance = GREATEST(COALESCE(importance, 5), $2),
+                            last_accessed = NOW(),
+                            {embedding_column} = NULL
+                        WHERE id = $3""",
                     clean_content,
-                    row["content"] or "",
-                    threshold,
+                    int(importance),
+                    matched_id,
                 )
-                if reason:
-                    matched = (row, reason, similarity)
-                    break
-
-            if matched:
-                row, reason, similarity = matched
-                matched_id = int(row["id"])
-                layer = int(row["layer"] or 1)
-
-                if (
-                    layer == 1
-                    and reason == "containment_update"
-                    and _is_materially_richer_memory(clean_content, row["content"] or "")
-                ):
-                    embedding_column = "embedding" if HAS_PGVECTOR else "embedding_json"
-                    await conn.execute(
-                        f"""UPDATE memories
-                            SET content = $1,
-                                importance = GREATEST(COALESCE(importance, 5), $2),
-                                last_accessed = NOW(),
-                                {embedding_column} = NULL
-                            WHERE id = $3""",
-                        clean_content,
-                        int(importance),
-                        matched_id,
-                    )
-                    embedding_refresh_id = matched_id
-                    result = {
-                        "action": "updated",
-                        "reason": reason,
-                        "memory_id": matched_id,
-                        "matched_id": matched_id,
-                        "similarity": similarity,
-                    }
-                else:
-                    result = {
-                        "action": "skipped",
-                        "reason": reason,
-                        "memory_id": matched_id,
-                        "matched_id": matched_id,
-                        "similarity": similarity,
-                    }
+                embedding_refresh_id = matched_id
+                result = {
+                    "action": "updated",
+                    "reason": decision["reason"],
+                    "memory_id": matched_id,
+                    "matched_id": matched_id,
+                    "similarity": decision["similarity"],
+                }
+            elif decision["op"] == "skip":
+                result = {
+                    "action": "skipped",
+                    "reason": decision["reason"],
+                    "memory_id": matched_id,
+                    "matched_id": matched_id,
+                    "similarity": decision["similarity"],
+                }
             else:
                 row = await conn.fetchrow(
                     """INSERT INTO memories (content, importance, source_session,
@@ -1791,11 +1893,16 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                 embedding_refresh_id = memory_id
                 result = {
                     "action": "inserted",
-                    "reason": None,
+                    "reason": decision["reason"],
                     "memory_id": memory_id,
-                    "matched_id": None,
-                    "similarity": None,
+                    "matched_id": matched_id,
+                    "similarity": decision["similarity"],
                 }
+                if memory_id and decision["supersede"] is not None:
+                    result.update(await _record_supersede(
+                        conn, memory_id, dict(decision["supersede"]), clean_content,
+                        mode, source_session,
+                    ))
 
             if result["action"] in ("inserted", "updated") and result["memory_id"] and source_ids:
                 await conn.execute(
@@ -1814,6 +1921,72 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
             print(f"⚠️ 记忆 {embedding_refresh_id} embedding刷新失败: {e}")
 
     return result
+
+
+# ============================================================
+# 更新提议（observe 模式下等人工采纳）
+# ============================================================
+
+async def list_update_proposals(status: str = "pending", limit: int = 200):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        where = "" if status == "all" else "WHERE p.status = $2"
+        params = [int(limit)] + ([] if status == "all" else [status])
+        rows = await conn.fetch(f"""
+            SELECT p.id, p.created_at, p.new_memory_id, p.old_memory_id,
+                   p.new_content, p.old_content, p.source, p.status, p.resolved_at,
+                   n.is_active AS new_active, o.is_active AS old_active,
+                   o.superseded_by AS old_superseded_by
+            FROM memory_update_proposals p
+            LEFT JOIN memories n ON n.id = p.new_memory_id
+            LEFT JOIN memories o ON o.id = p.old_memory_id
+            {where}
+            ORDER BY p.id DESC
+            LIMIT $1
+        """, *params)
+        pending = await conn.fetchval(
+            "SELECT COUNT(*) FROM memory_update_proposals WHERE status = 'pending'"
+        )
+        return [dict(row) for row in rows], int(pending or 0)
+
+
+class ProposalConflict(Exception):
+    pass
+
+
+async def resolve_update_proposal(proposal_id: int, accept: bool) -> dict:
+    """采纳 = 归档旧条并记下 superseded_by；忽略 = 只改提议状态。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """SELECT id, new_memory_id, old_memory_id, status
+                   FROM memory_update_proposals WHERE id = $1 FOR UPDATE""",
+                int(proposal_id),
+            )
+            if not row:
+                raise ProposalConflict("提议不存在")
+            if row["status"] != "pending":
+                raise ProposalConflict("这条提议已经处理过了")
+            archived = 0
+            if accept:
+                new_active = await conn.fetchval(
+                    "SELECT is_active FROM memories WHERE id = $1", row["new_memory_id"],
+                )
+                if not new_active:
+                    raise ProposalConflict("新记忆已经不在活跃记忆里，不能用它取代旧记忆")
+                command = await conn.execute(
+                    """UPDATE memories SET is_active = FALSE, superseded_by = $1
+                       WHERE id = $2 AND is_active = TRUE""",
+                    row["new_memory_id"], row["old_memory_id"],
+                )
+                archived = int(command.split()[-1]) if command else 0
+            await conn.execute(
+                """UPDATE memory_update_proposals
+                   SET status = $2, resolved_at = NOW() WHERE id = $1""",
+                int(proposal_id), "accepted" if accept else "ignored",
+            )
+    return {"status": "accepted" if accept else "ignored", "archived": archived}
 
 
 async def dedupe_active_fragment_memories(
@@ -2892,7 +3065,7 @@ async def restore_archived_memories_batch(memory_ids: list):
     async with pool.acquire() as conn:
         result = await conn.execute(
             """UPDATE memories
-               SET is_active = TRUE
+               SET is_active = TRUE, superseded_by = NULL
                WHERE id = ANY($1::int[]) AND is_active = FALSE""",
             memory_ids,
         )

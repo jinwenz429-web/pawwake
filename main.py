@@ -46,6 +46,7 @@ from database import (
 from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, replace_last_conversation_round, archive_replaced_answer_memories, delete_assistant_rounds, delete_auxiliary_suggestion_messages, delete_redundant_reroll_tail, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 from database import get_active_memories_count, get_core_memories, get_memory_by_id, compute_valid_until, get_last_user_message_id
+from database import list_update_proposals, resolve_update_proposal, ProposalConflict
 import memory_mcp
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
@@ -116,6 +117,10 @@ MEMORY_RECALL_QUERY_ROUNDS = max(1, int(os.getenv("MEMORY_RECALL_QUERY_ROUNDS", 
 # 记忆 MCP 服务（/mcp）：只读工具默认开；写入工具（remember / update_memory）默认关
 MEMORY_MCP_ENABLED = os.getenv("MEMORY_MCP_ENABLED", "true").lower() == "true"
 MEMORY_MCP_WRITE_ENABLED = os.getenv("MEMORY_MCP_WRITE_ENABLED", "false").lower() == "true"
+
+# 提取时给模型对比的已知记忆：按这次对话检索最相关的 N 条，再补上核心记忆（最多 15 条）
+MEMORY_EXTRACT_CONTEXT_LIMIT = max(0, int(os.getenv("MEMORY_EXTRACT_CONTEXT_LIMIT", "30")))
+EXTRACT_CORE_CONTEXT_LIMIT = 15
 
 # 每轮固定注入的核心记忆条数（layer 3，按 importance 取最高的几条），0 = 不常驻
 MEMORY_CORE_ALWAYS_INJECT = max(0, int(os.getenv("MEMORY_CORE_ALWAYS_INJECT", "8")))
@@ -362,6 +367,7 @@ async def lifespan(app: FastAPI):
                     "MEMORY_CORE_ALWAYS_INJECT": lambda v: max(0, int(v)),
                     "MEMORY_MCP_ENABLED": lambda v: _parse_bool(v),
                     "MEMORY_MCP_WRITE_ENABLED": lambda v: _parse_bool(v),
+                    "MEMORY_EXTRACT_CONTEXT_LIMIT": lambda v: max(0, int(v)),
                     "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
                     "CACHE_PARTITION_X": int, "CACHE_PARTITION_TRIGGER": str,
                     "CACHE_PARTITION_WINDOW": int, "CACHE_SUMMARY_MODEL": str,
@@ -383,6 +389,7 @@ async def lifespan(app: FastAPI):
                     "MEMORY_HW_IMPORTANCE": float, "MEMORY_HW_RECENCY": float,
                     "MEMORY_SEMANTIC_THRESHOLD": float,
                     "MEMORY_STATE_TTL_DAYS": lambda v: max(1, int(v)),
+                    "MEMORY_UPDATE_MODE": lambda v: "apply" if str(v).strip().lower() == "apply" else "observe",
                 }
                 # 显式空值也要恢复，否则重启时环境默认会覆盖面板上的清空操作。
                 _ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL"}
@@ -1939,6 +1946,39 @@ async def store_proactive_reply(
     await save_message(session_id, "assistant", rest, model, metadata=metadata)
 
 
+async def _extraction_context_memories(messages_for_extraction: list) -> list:
+    """提取时给模型做对比的已知记忆：
+
+    - 拿这次提取窗口的文字去混合检索，取最相关的 MEMORY_EXTRACT_CONTEXT_LIMIT 条
+    - 再补上活跃的核心记忆（太多就取 importance 最高的 15 条）
+    - 去重。检索失败时退回最近的记忆，保证模型至少有东西可比
+    """
+    window_text = "\n".join(
+        str(message.get("content") or "") for message in messages_for_extraction
+    ).strip()
+    related = []
+    if window_text and MEMORY_EXTRACT_CONTEXT_LIMIT > 0:
+        try:
+            related = [dict(row) for row in await search_memories(window_text, limit=MEMORY_EXTRACT_CONTEXT_LIMIT)]
+        except Exception as e:
+            print(f"⚠️ 提取前检索相关记忆失败，退回最近记忆: {e}")
+            related = [dict(row) for row in await get_recent_memories(limit=MEMORY_EXTRACT_CONTEXT_LIMIT)]
+    try:
+        core = await get_core_memories(EXTRACT_CORE_CONTEXT_LIMIT)
+    except Exception as e:
+        print(f"⚠️ 提取前读取核心记忆失败: {e}")
+        core = []
+    merged = []
+    seen = set()
+    for mem in list(related) + list(core):
+        memory_id = int(mem["id"])
+        if memory_id in seen:
+            continue
+        seen.add(memory_id)
+        merged.append(mem)
+    return merged
+
+
 async def _extract_and_store_memories(
     session_id: str,
     user_msg: str,
@@ -1949,8 +1989,6 @@ async def _extract_and_store_memories(
     guard_meta,
 ):
     """提取 + 入库。调用方负责拿按 session 的锁。"""
-    # 3. 获取已有记忆，传给提取模型做对比去重
-    existing = [dict(row) for row in await get_recent_memories(limit=80)]
     
     # 4. 按逻辑轮截取近期上下文，而非发送完整会话。
     if context_messages:
@@ -1980,6 +2018,10 @@ async def _extract_and_store_memories(
     
     if guard_meta is not None:
         messages_for_extraction = persona_guard.filter_extraction_messages(messages_for_extraction)
+
+    # 3. 给模型对比的已知记忆：拿这次的对话去检索最相关的，再补上核心记忆
+    existing = await _extraction_context_memories(messages_for_extraction)
+    shown_ids = {int(mem["id"]) for mem in existing}
     extraction_now = datetime.now(timezone.utc)
     new_memories = await extract_memories(
         messages_for_extraction, existing_memories=existing, now=extraction_now,
@@ -2008,6 +2050,10 @@ async def _extract_and_store_memories(
     for mem in filtered_memories:
         kind = mem.get("kind")
         event_date = mem.get("event_date")
+        target_id = mem.get("target_id") if mem.get("action") == "update" else None
+        if target_id is not None and target_id not in shown_ids:
+            print(f"ℹ️ 模型要取代的 #{target_id} 不在这次给它看的记忆里，按新记忆处理")
+            target_id = None
         result = await save_memory_deduplicated(
             content=mem["content"],
             importance=mem["importance"],
@@ -2017,8 +2063,11 @@ async def _extract_and_store_memories(
             event_date=event_date,
             # valid_until 由代码定：state = 记录日 + TTL，plan = event_date + 3 天
             valid_until=compute_valid_until(kind, event_date, record_date),
+            supersede_target_id=target_id,
         )
         action = result.get("action", "skipped")
+        if result.get("supersedes"):
+            dedup_stats["supersedes"] = dedup_stats.get("supersedes", 0) + 1
         dedup_stats[action] = dedup_stats.get(action, 0) + 1
         if action == "skipped" and result.get("reason"):
             print(
@@ -2033,6 +2082,7 @@ async def _extract_and_store_memories(
             f"新增 {dedup_stats['inserted']}，"
             f"升级 {dedup_stats['updated']}，"
             f"去重跳过 {dedup_stats['skipped']}，"
+            f"取代旧记忆 {dedup_stats.get('supersedes', 0)}（{_db_module.current_update_mode()}），"
             f"meta过滤 {rejected_meta}，来源不合格 {rejected_source}，"
             f"总计 {total} 条（活跃）"
         )
@@ -2383,13 +2433,16 @@ async def _mcp_update_memory(target_id: int, content: str) -> str:
         kind=kind,
         event_date=target.get("event_date"),
         valid_until=compute_valid_until(kind, target.get("event_date"), _local_today()),
+        supersede_target_id=target_id,
     )
     new_id = result.get("memory_id")
-    # 取代逻辑（MEMORY_UPDATE_MODE）在下一个版本接上；现在只记新条、不动旧条
-    print(f"🧩 MCP update_memory: 打算用 #{new_id} 取代 #{target_id}（暂不改动旧条）", flush=True)
-    if result.get("action") == "inserted":
-        return f"已记下新的现状（记忆 #{new_id}）；旧记忆 #{target_id} 暂时保留，等人工确认后再归档。"
-    return f"新内容和已有记忆 #{result.get('matched_id')} 重复，没有新增；旧记忆 #{target_id} 未改动。"
+    print(f"🧩 MCP update_memory: action={result.get('action')}, new=#{new_id}, old=#{target_id}, "
+          f"mode={result.get('update_mode')}", flush=True)
+    if result.get("action") != "inserted":
+        return f"新内容和已有记忆 #{result.get('matched_id')} 重复，没有新增；旧记忆 #{target_id} 未改动。"
+    if result.get("update_mode") == "apply":
+        return f"已更新：新记忆 #{new_id} 取代了 #{target_id}。"
+    return f"已记下新的现状（记忆 #{new_id}）；取代 #{target_id} 的提议等对方在后台确认。"
 
 
 MEMORY_TOOLSET = memory_mcp.MemoryToolset(
@@ -3773,6 +3826,45 @@ async def api_batch_restore(request: Request):
 
 
 # ============================================================
+# 记忆更新提议（MEMORY_UPDATE_MODE=observe 时积累，人工采纳/忽略）
+# ============================================================
+
+def _local_time_text(value):
+    if not value:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone(timedelta(hours=TIMEZONE_HOURS))).strftime("%Y-%m-%d %H:%M")
+
+
+@app.get("/api/memories/update-proposals")
+async def api_update_proposals(status: str = "pending"):
+    if status not in ("pending", "accepted", "ignored", "all"):
+        return JSONResponse(status_code=400, content={"error": "status 只能是 pending/accepted/ignored/all"})
+    items, pending = await list_update_proposals(status)
+    for item in items:
+        item["created_at"] = _local_time_text(item.get("created_at"))
+        item["resolved_at"] = _local_time_text(item.get("resolved_at"))
+    return {"items": items, "pending": pending, "mode": _db_module.current_update_mode()}
+
+
+@app.post("/api/memories/update-proposals/{proposal_id}/accept")
+async def api_accept_update_proposal(proposal_id: int):
+    try:
+        return await resolve_update_proposal(proposal_id, accept=True)
+    except ProposalConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+
+
+@app.post("/api/memories/update-proposals/{proposal_id}/ignore")
+async def api_ignore_update_proposal(proposal_id: int):
+    try:
+        return await resolve_update_proposal(proposal_id, accept=False)
+    except ProposalConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+
+
+# ============================================================
 # 整库重整：先审阅持久化方案，再显式确认应用
 # ============================================================
 
@@ -4335,7 +4427,7 @@ async def api_restore_memory(memory_id: int):
         return {"error": "记忆系统未启用"}
     
     try:
-        await update_memory_with_layer(memory_id, is_active=True)
+        await restore_archived_memories_batch([memory_id])
         return {"status": "ok", "id": memory_id}
     except Exception:
         return _api_failure("恢复记忆失败")
@@ -5138,6 +5230,8 @@ async def get_settings():
             "MEMORY_CORE_ALWAYS_INJECT": int(db.get("MEMORY_CORE_ALWAYS_INJECT") or MEMORY_CORE_ALWAYS_INJECT),
             "MEMORY_MCP_ENABLED": _parse_bool(db.get("MEMORY_MCP_ENABLED"), MEMORY_MCP_ENABLED),
             "MEMORY_MCP_WRITE_ENABLED": _parse_bool(db.get("MEMORY_MCP_WRITE_ENABLED"), MEMORY_MCP_WRITE_ENABLED),
+            "MEMORY_EXTRACT_CONTEXT_LIMIT": int(db.get("MEMORY_EXTRACT_CONTEXT_LIMIT") or MEMORY_EXTRACT_CONTEXT_LIMIT),
+            "MEMORY_UPDATE_MODE": _db_module.current_update_mode() if not db.get("MEMORY_UPDATE_MODE") else ("apply" if db.get("MEMORY_UPDATE_MODE") == "apply" else "observe"),
 
             # 缓存分区
             "CACHE_PARTITION_ENABLED": _parse_bool(db.get("CACHE_PARTITION_ENABLED"), CACHE_PARTITION_ENABLED),
@@ -5218,6 +5312,7 @@ async def save_settings(request: Request):
             "MEMORY_CORE_ALWAYS_INJECT": lambda v: max(0, int(v)),
             "MEMORY_MCP_ENABLED":    lambda v: _parse_bool(v),
             "MEMORY_MCP_WRITE_ENABLED": lambda v: _parse_bool(v),
+            "MEMORY_EXTRACT_CONTEXT_LIMIT": lambda v: max(0, int(v)),
             "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
             "CACHE_PARTITION_X":     int,
             "CACHE_PARTITION_TRIGGER": str,
@@ -5247,6 +5342,7 @@ async def save_settings(request: Request):
             "MEMORY_HW_RECENCY":       float,
             "MEMORY_SEMANTIC_THRESHOLD": float,
             "MEMORY_STATE_TTL_DAYS":   lambda v: max(1, int(v)),
+            "MEMORY_UPDATE_MODE":      lambda v: "apply" if str(v).strip().lower() == "apply" else "observe",
         }
 
         # 只存 os.environ 的变量
