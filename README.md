@@ -77,7 +77,7 @@ Give your AI long-term memory. A lightweight proxy gateway that adds a memory la
 | `API_BASE_URL` | LLM API 地址 | `https://openrouter.ai/api/v1/chat/completions` |
 | `DEFAULT_MODEL` | 默认模型 | `anthropic/claude-sonnet-4.5` |
 | `PORT` | 端口 | `8000` |
-| `GATEWAY_SECRET`（强烈建议） | 程序 API 鉴权密钥，客户端通过 `X-Gateway-Key` 请求头发送 | 独立随机值 |
+| `GATEWAY_SECRET`（强烈建议） | 程序 API 鉴权密钥，客户端通过 `X-Gateway-Key` 请求头发送，或者像 OpenAI 客户端一样用 `Authorization: Bearer` | 独立随机值 |
 | `DASHBOARD_PASSWORD` | Dashboard 登录密码，不与网关密钥共用 | 独立强密码 |
 | `SESSION_SECRET` | Dashboard 会话签名密钥，至少 32 字符且每次部署保持不变 | 独立随机值 |
 | `MEMORY_REBUILD_APPLY_TOKEN` | 碎片整理 Apply 的独立密钥，至少 32 字符；不配置时 Apply 接口关闭 | 独立随机值 |
@@ -375,6 +375,13 @@ A: 打开 `https://你的网关地址/dashboard`，在「导出备份」页面�
 A: 能。这个项目的第一个部署者就是不会写代码的——代码是 AI 写的，部署是她自己看文档搞定的。
 
 ## 📋 更新日志
+
+### Kelivo 直连（2026-11-19，本 fork）
+
+- **不再需要 Dylan** — Kelivo 伴侣版（jinwenz429-web/kelivo 的 companion-apk 分支）直接把 Pawwake 当 OpenAI 兼容接口用：地址填 `https://你的域名/v1`，API Key 填 `GATEWAY_SECRET`（现在也认 `Authorization: Bearer`）
+- **主动回合** — Kelivo 自己醒来时，请求末尾那条「只有它看得到的提示」不会当成用户说的话存起来，也不提取记忆；回复只存助手这一条，回 `[静默]` 就什么都不存。醒来时会带上最近 3 篇（7 天内）日记
+- **日记** — 回复里的 `[DIARY]...[/DIARY]` 存进日记表（沿用 `dylan_diary`，八月以来的旧日记都在），Dashboard 新增「它的日记」页，可以看、可以删。Dylan 的 `/internal/dylan-diary` 接口已删除
+- **出戏保护补全** — 原来在 Dylan 里的「重说一次」搬到这里：非流式请求确认出戏时原样再问一次；流式请求把判定记在客户端发来的 `X-Persona-Guard-Request-Id` 下，Kelivo 收完来 `GET /v1/persona-guard/verdicts/{id}` 问，需要就自己重说。`PERSONA_GUARD_MODE=observe` 时只记录不重说
 
 ### v4.0.3 · Madeleine（2026-08-18）
 

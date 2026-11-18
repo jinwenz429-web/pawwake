@@ -54,7 +54,8 @@ from memory_rebuilder import (
     apply_memory_rebuild_plan,
     RebuildApplyConflict,
 )
-from diary_store import ensure_dylan_diary_table, save_dylan_diary
+from diary_store import ensure_dylan_diary_table, save_dylan_diary, recent_diaries, list_diaries, delete_diary
+import companion_turns
 import persona_guard
 from persona_guard_store import ensure_persona_guard_table, save_quarantine, recent_quarantine_fingerprints
 
@@ -519,6 +520,11 @@ async def gateway_auth_middleware(request: Request, call_next):
 
     # 程序调用只接受请求头，不让主密钥进入 URL、浏览器历史或前端脚本。
     provided_key = request.headers.get("X-Gateway-Key", "")
+    if not provided_key:
+        # OpenAI 兼容客户端（如 Kelivo 直连）只会发 Authorization: Bearer <key>
+        authorization = request.headers.get("Authorization", "")
+        if authorization[:7].lower() == "bearer ":
+            provided_key = authorization[7:].strip()
     if GATEWAY_SECRET and secrets.compare_digest(provided_key, GATEWAY_SECRET):
         return await call_next(request)
 
@@ -552,37 +558,13 @@ async def gateway_auth_middleware(request: Request, call_next):
 
     return JSONResponse(
         status_code=401,
-        content={"error": "Unauthorized. Provide X-Gateway-Key header."},
+        content={"error": "Unauthorized. Provide X-Gateway-Key or Authorization: Bearer header."},
     )
 
 
 # ============================================================
 # 记忆注入
 # ============================================================
-
-@app.post("/internal/dylan-diary")
-async def write_dylan_diary(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"error": "Invalid JSON body."})
-
-    content = str((body or {}).get("content") or "").strip()
-    metadata = (body or {}).get("metadata")
-
-    if not content:
-        return JSONResponse(status_code=400, content={"error": "content is required."})
-    if metadata is not None and not isinstance(metadata, dict):
-        return JSONResponse(status_code=400, content={"error": "metadata must be an object."})
-
-    try:
-        diary_id = await save_dylan_diary(content, metadata or {})
-    except Exception:
-        logger.exception("Failed to persist Dylan diary")
-        return JSONResponse(status_code=500, content={"error": "Failed to persist diary."})
-
-    return JSONResponse(status_code=201, content={"ok": True, "id": diary_id})
-
 
 def _format_memory_line(mem: dict) -> str:
     date_value = ""
@@ -1659,6 +1641,34 @@ async def build_conversation_recall_text(user_message: str, session_id: str):
 # 后台记忆处理
 # ============================================================
 
+async def store_proactive_reply(
+    session_id: str,
+    assistant_msg: str,
+    model: str,
+    assistant_reasoning: str = None,
+    persist_conversation: bool = True,
+):
+    """Kelivo 主动回合：日记进日记表，回复本身只存助手这一条；静默就什么都不存。"""
+    rest, diaries = companion_turns.split_diary(assistant_msg or "")
+    for body in diaries:
+        try:
+            await save_dylan_diary(body, {
+                "source": "kelivo",
+                "session": _partition_session_id_hash(session_id),
+            })
+        except Exception:
+            logger.exception("Failed to persist companion diary")
+    if diaries:
+        print(f"📔 主动回合写了 {len(diaries)} 篇日记", flush=True)
+    if not persist_conversation:
+        return
+    if not rest or companion_turns.is_silence(rest):
+        print("🤫 主动回合选择静默，不存对话", flush=True)
+        return
+    metadata = json.dumps({"reasoning_content": assistant_reasoning}) if assistant_reasoning else None
+    await save_message(session_id, "assistant", rest, model, metadata=metadata)
+
+
 async def process_memories_background(
     session_id: str,
     user_msg: str,
@@ -2044,6 +2054,18 @@ async def list_models():
     }
 
 
+@app.get("/v1/persona-guard/verdicts/{request_id}")
+async def persona_guard_verdict(request_id: str):
+    """Kelivo 收完一条流式回复后来问：这条出戏了没有、要不要重说一次。"""
+    if not re.fullmatch(r"[A-Za-z0-9-]{8,64}", request_id or ""):
+        return JSONResponse(status_code=400, content={"error": "invalid request id"})
+    status = await companion_turns.VERDICTS.get(request_id)
+    return {
+        "status": status or "UNKNOWN",
+        "regenerate": status == persona_guard.CONFIRMED_DRIFT and companion_turns.auto_regenerate_enabled(),
+    }
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """核心转发接口"""
@@ -2187,6 +2209,28 @@ async def _chat_completions_inner(request: Request):
                     if isinstance(item, dict) and item.get("type") == "text"
                 )
             break
+
+    # ---------- Kelivo 主动回合（它自己醒来找你） ----------
+    # 末尾那条 user 是只有它看得到的提示，不是用户说的话：不存、不提取记忆、不做出戏判断。
+    proactive_turn = not skip_conversation_log and companion_turns.is_proactive_cue(user_message)
+    if proactive_turn:
+        guard_meta = None
+        try:
+            diary_entries = await recent_diaries(
+                companion_turns.DIARY_CONTEXT_ENTRIES, companion_turns.DIARY_CONTEXT_DAYS,
+            )
+        except Exception as e:
+            print(f"⚠️ 读取最近日记失败（这次醒来不带日记）: {type(e).__name__}", flush=True)
+            diary_entries = []
+        diary_text = companion_turns.diary_context(diary_entries)
+        if diary_text:
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    if isinstance(msg.get("content"), str):
+                        msg["content"] = f"{msg['content']}\n\n{diary_text}"
+                        user_message = msg["content"]
+                    break
+        print(f"🌙 Kelivo 主动回合（带 {len(diary_entries)} 篇日记）", flush=True)
     
     # ---------- 构建 system prompt ----------
     # 先保存原始对话消息（不含 system prompt），用于记忆提取
@@ -2583,6 +2627,7 @@ async def _chat_completions_inner(request: Request):
                 partition_reroll,
                 reroll_expected_assistant_id,
                 guard_meta=guard_meta,
+                proactive_turn=proactive_turn,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -2603,20 +2648,36 @@ async def _chat_completions_inner(request: Request):
                 if failure:
                     print(f"upstream_failure stream=False status={failure[0]}", flush=True)
                     return JSONResponse(status_code=failure[0], content=failure[1])
-                assistant_msg = ""
-                assistant_tool_calls = None
-                assistant_reasoning = None
-                try:
-                    msg_obj = resp_data["choices"][0]["message"]
-                    assistant_msg = msg_obj.get("content") or msg_obj.get("refusal") or ""
-                    if msg_obj.get("tool_calls"):
-                        assistant_tool_calls = msg_obj["tool_calls"]
-                        print(f"🔧 Response 包含 {len(assistant_tool_calls)} 个工具调用")
-                    if msg_obj.get("reasoning_content"):
-                        assistant_reasoning = msg_obj["reasoning_content"]
-                        print(f"🧠 Response 包含 reasoning_content ({len(assistant_reasoning)}字符)")
-                except (KeyError, IndexError):
-                    pass
+                assistant_msg, assistant_tool_calls, assistant_reasoning = _parse_completion(resp_data)
+
+                # 出戏保护（非流式）：确认出戏就在这里原样再问一次，客户端只拿到被采纳的那条。
+                if (
+                    guard_meta is not None
+                    and user_message
+                    and not assistant_tool_calls
+                    and companion_turns.auto_regenerate_enabled()
+                ):
+                    first = persona_guard.detect_drift(
+                        assistant_msg,
+                        user_message,
+                        [m for m in extraction_context_messages if m.get("role") != "system"],
+                        ai_self_aware=persona_guard.ai_self_aware_override(),
+                    )
+                    if first["status"] == persona_guard.CONFIRMED_DRIFT:
+                        persona_guard.log_event(status=first["status"], rules=first["rules"],
+                                                action="regenerate_inline", stage="initial")
+                        try:
+                            retry = await client.post(API_BASE_URL, headers=headers, json=body)
+                            retry_data = retry.json() if retry.status_code == 200 else None
+                        except (httpx.HTTPError, ValueError):
+                            retry_data = None
+                        if retry_data is not None and not _upstream_failure(retry_data, final=True):
+                            resp_data = retry_data
+                            assistant_msg, assistant_tool_calls, assistant_reasoning = _parse_completion(resp_data)
+                _record_guard_verdict(
+                    guard_meta, assistant_msg, user_message, extraction_context_messages,
+                    has_tool_calls=bool(assistant_tool_calls),
+                )
 
                 if pending_fragment_ids:
                     try:
@@ -2628,7 +2689,12 @@ async def _chat_completions_inner(request: Request):
                     except Exception as e:
                         print(f"⚠️ 对话召回 seen 写入失败，保留待下次重试: {e}")
                 
-                if conversation_persistence_enabled() and (user_message or tool_messages):
+                if proactive_turn:
+                    asyncio.create_task(store_proactive_reply(
+                        session_id, assistant_msg, model, assistant_reasoning,
+                        persist_conversation=conversation_persistence_enabled(),
+                    ))
+                elif conversation_persistence_enabled() and (user_message or tool_messages):
                     asyncio.create_task(
                         process_memories_background(session_id, user_message, assistant_msg, model, 
                                                     context_messages=extraction_context_messages,
@@ -2650,6 +2716,52 @@ async def _chat_completions_inner(request: Request):
                 return JSONResponse(status_code=response.status_code, content=error_content)
 
 
+def _parse_completion(resp_data: dict) -> tuple:
+    """(content, tool_calls, reasoning) of a non-stream chat completion."""
+    assistant_msg, tool_calls, reasoning = "", None, None
+    try:
+        msg_obj = resp_data["choices"][0]["message"]
+        assistant_msg = msg_obj.get("content") or msg_obj.get("refusal") or ""
+        if msg_obj.get("tool_calls"):
+            tool_calls = msg_obj["tool_calls"]
+            print(f"🔧 Response 包含 {len(tool_calls)} 个工具调用")
+        if msg_obj.get("reasoning_content"):
+            reasoning = msg_obj["reasoning_content"]
+            print(f"🧠 Response 包含 reasoning_content ({len(reasoning)}字符)")
+    except (KeyError, IndexError, TypeError):
+        pass
+    return assistant_msg, tool_calls, reasoning
+
+
+def _record_guard_verdict(
+    guard_meta: dict | None,
+    reply: str,
+    user_message: str,
+    context_messages: list | None,
+    finish_reason: str = "",
+    has_tool_calls: bool = False,
+) -> str | None:
+    """Detect drift for a client that sent a request id, and keep the verdict
+    for ``GET /v1/persona-guard/verdicts/{id}``. Never raises."""
+    request_id = (guard_meta or {}).get("request_id") or ""
+    if not request_id or not user_message:
+        return None
+    try:
+        verdict = persona_guard.detect_drift(
+            reply or "",
+            user_message,
+            [m for m in (context_messages or []) if m.get("role") != "system"],
+            finish_reason=finish_reason,
+            has_tool_calls=has_tool_calls,
+            ai_self_aware=persona_guard.ai_self_aware_override(),
+        )
+    except Exception as e:
+        print(f"⚠️ persona_guard 判定失败（当作正常）: {type(e).__name__}", flush=True)
+        return None
+    companion_turns.VERDICTS.put(request_id, verdict["status"])
+    return verdict["status"]
+
+
 async def stream_and_capture(
     headers: dict,
     body: dict,
@@ -2664,6 +2776,7 @@ async def stream_and_capture(
     reroll: bool = False,
     reroll_expected_assistant_id: int = None,
     guard_meta: dict = None,
+    proactive_turn: bool = False,
 ):
     """逐帧透传有效 SSE 并捕获完整回复；失败响应回传错误，不进入记忆。"""
     full_response = []
@@ -2774,6 +2887,15 @@ async def stream_and_capture(
                 yield _upstream_failure_sse(failure)
                 return
             stream_succeeded = True
+            # 出戏判断在最后一帧之前记下，Kelivo 收完就能来问要不要重说。
+            _record_guard_verdict(
+                guard_meta,
+                "".join(full_response) or "".join(full_refusal),
+                user_message,
+                extraction_context_messages,
+                finish_reason=finish_reason or "",
+                has_tool_calls=bool(accumulated_tool_calls),
+            )
             yield done_frame or b"data: [DONE]\n\n"
     
     assistant_msg = "".join(full_response) or "".join(full_refusal)
@@ -2804,7 +2926,12 @@ async def stream_and_capture(
             asyncio.create_task(save_token_usage(session_id, model, pt, ct, tt))
             print(f"📊 Stream Token: {pt} + {ct} = {tt}")
     
-    if stream_succeeded and conversation_persistence_enabled() and (user_message or tool_messages):
+    if stream_succeeded and proactive_turn:
+        asyncio.create_task(store_proactive_reply(
+            session_id, assistant_msg, model, assistant_reasoning,
+            persist_conversation=conversation_persistence_enabled(),
+        ))
+    elif stream_succeeded and conversation_persistence_enabled() and (user_message or tool_messages):
         asyncio.create_task(
             process_memories_background(session_id, user_message, assistant_msg, model, 
                                         context_messages=extraction_context_messages,
@@ -3851,6 +3978,43 @@ async def import_memories(request: Request):
 # ============================================================
 # 对话记录管理 API
 # ============================================================
+
+@app.get("/api/diaries")
+async def api_list_diaries(limit: int = 50, offset: int = 0):
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+    try:
+        rows, total = await list_diaries(limit, offset)
+    except Exception:
+        logger.exception("Failed to list diaries")
+        return JSONResponse(status_code=500, content={"error": "Failed to load diaries."})
+    items = []
+    for row in rows:
+        try:
+            metadata = json.loads(row.get("metadata") or "null") or {}
+        except ValueError:
+            metadata = {}
+        created = row.get("created_at")
+        items.append({
+            "id": row["id"],
+            "content": row["content"],
+            "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+            "source": metadata.get("source") or "dylan",
+        })
+    return {"items": items, "total": total}
+
+
+@app.delete("/api/diaries/{diary_id}")
+async def api_delete_diary(diary_id: int):
+    try:
+        deleted = await delete_diary(diary_id)
+    except Exception:
+        logger.exception("Failed to delete diary")
+        return JSONResponse(status_code=500, content={"error": "Failed to delete diary."})
+    if not deleted:
+        return JSONResponse(status_code=404, content={"error": "Diary not found."})
+    return {"ok": True}
+
 
 @app.get("/api/conversations")
 async def api_conversations(page: int = 1, per_page: int = 20):
