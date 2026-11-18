@@ -1,3 +1,5 @@
+"""Diary entries the companion writes when it wakes (table name kept from the Dylan era)."""
+
 import json
 from typing import Any, Optional
 
@@ -42,3 +44,45 @@ async def save_dylan_diary(content: str, metadata: Optional[dict[str, Any]] = No
             encoded_metadata,
         )
     return int(diary_id)
+
+
+async def recent_diaries(limit: int = 3, days: int = 7) -> list[dict]:
+    """Newest entries within ``days``, newest first."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, content, created_at
+            FROM dylan_diary
+            WHERE created_at >= NOW() - make_interval(days => $2)
+            ORDER BY created_at DESC
+            LIMIT $1;
+            """,
+            int(limit),
+            int(days),
+        )
+    return [dict(row) for row in rows]
+
+
+async def list_diaries(limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, content, created_at, metadata
+            FROM dylan_diary
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2;
+            """,
+            int(limit),
+            int(offset),
+        )
+        total = await conn.fetchval("SELECT COUNT(*) FROM dylan_diary;")
+    return [dict(row) for row in rows], int(total or 0)
+
+
+async def delete_diary(diary_id: int) -> bool:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM dylan_diary WHERE id = $1;", int(diary_id))
+    return result.endswith(" 1")

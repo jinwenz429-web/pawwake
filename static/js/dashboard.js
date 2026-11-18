@@ -86,6 +86,9 @@ function switchSection(name) {
     if (name === 'settings') {
         loadSettings();
     }
+    if (name === 'diaries') {
+        loadDiaries(0);
+    }
 }
 
 // ============================================
@@ -2502,4 +2505,52 @@ function showSettingsMsg(type, text) {
     el.className = 'msg-box msg-' + type;
     el.textContent = text;
     setTimeout(() => { el.style.display = 'none'; }, 5000);
+}
+
+// ============================================
+// 它的日记
+// ============================================
+let _diaryOffset = 0;
+
+async function loadDiaries(offset) {
+    const list = document.getElementById('diary-list');
+    const more = document.getElementById('diary-more');
+    const pageSize = 30;
+    try {
+        const resp = await fetch(`/api/diaries?limit=${pageSize}&offset=${offset}`);
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || resp.status);
+        if (offset === 0) list.innerHTML = '';
+        document.getElementById('diary-count').textContent = `共 ${data.total} 篇`;
+        if (offset === 0 && data.items.length === 0) {
+            list.textContent = '还没有日记。它在 Kelivo 里自己醒来时才会写。';
+        }
+        for (const item of data.items) {
+            const card = document.createElement('div');
+            card.style.cssText = 'padding: 12px 0; border-bottom: 1px solid var(--border-color, #eee);';
+            const when = new Date(item.created_at).toLocaleString('zh-CN', { hour12: false });
+            card.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <span style="font-size: 12px; color: var(--text-muted);">${escHtml(when)} · ${item.source === 'kelivo' ? 'Kelivo' : 'Dylan'}</span>
+                    <button class="btn btn-sm" data-diary-id="${item.id}">删除</button>
+                </div>
+                <div style="white-space: pre-wrap; color: var(--text-primary, inherit);">${escHtml(item.content)}</div>`;
+            card.querySelector('button').addEventListener('click', () => deleteDiary(item.id, card));
+            list.appendChild(card);
+        }
+        _diaryOffset = offset + data.items.length;
+        more.style.display = _diaryOffset < data.total ? 'inline-block' : 'none';
+    } catch (e) {
+        list.textContent = '加载失败: ' + e.message;
+    }
+}
+
+async function deleteDiary(id, card) {
+    if (!confirm('删掉这篇日记？它以后醒来就看不到了。')) return;
+    const resp = await fetch(`/api/diaries/${id}`, { method: 'DELETE' });
+    if (resp.ok) {
+        card.remove();
+    } else {
+        alert('删除失败');
+    }
 }
