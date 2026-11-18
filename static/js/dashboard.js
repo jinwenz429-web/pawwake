@@ -89,6 +89,9 @@ function switchSection(name) {
     if (name === 'diaries') {
         loadDiaries(0);
     }
+    if (name === 'proposals') {
+        loadProposals();
+    }
 }
 
 // ============================================
@@ -222,7 +225,7 @@ function renderTable(mems, startIndex) {
             '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escHtml(titleDisplay) + '" placeholder="无标题"></td>' +
             '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escHtml(m.content) + '</textarea></td>' +
             '<td class="col-importance"><input type="number" class="importance-input" id="i_' + m.id + '" value="' + m.importance + '" min="1" max="10"></td>' +
-            '<td class="col-time">' + fmtTime(m.event_date || m.created_at) + '</td>' +
+            '<td class="col-time">' + fmtTime(m.event_date || m.created_at) + memMetaBadges(m) + '</td>' +
             '<td class="col-actions"><div class="row-actions">' +
                 '<button class="btn btn-primary btn-sm" onclick="saveMem(' + m.id + ')">保存</button>' +
                 revertBtn +
@@ -231,6 +234,17 @@ function renderTable(mems, startIndex) {
             '</div></td>' +
             '</tr>';
     }).join('');
+}
+
+const MEMORY_KIND_LABELS = {fact: '事实', state: '状态', event: '事件', plan: '计划', promise: '约定'};
+
+function memMetaBadges(m) {
+    const parts = [];
+    if (m.kind && MEMORY_KIND_LABELS[m.kind]) parts.push(MEMORY_KIND_LABELS[m.kind]);
+    if (m.valid_until) parts.push('有效至 ' + String(m.valid_until).slice(0, 10));
+    if (m.superseded_by) parts.push('已被 #' + m.superseded_by + ' 取代');
+    if (!parts.length) return '';
+    return '<div class="form-hint" style="margin-top:4px;">' + escHtml(parts.join(' · ')) + '</div>';
 }
 
 function escHtml(s) {
@@ -2262,10 +2276,11 @@ let _modelList = [];
 
 // 所有需要读写的字段 key（开源版：EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
 const _SETTINGS_FIELDS = {
-    str: ['API_BASE_URL', 'API_KEY', 'DEFAULT_MODEL', 'MEMORY_API_KEY', 'MEMORY_MODEL',
+    str: ['API_BASE_URL', 'API_KEY', 'DEFAULT_MODEL', 'MEMORY_API_KEY', 'MEMORY_MODEL', 'MEMORY_UPDATE_MODE',
           'CACHE_SUMMARY_MODEL', 'CACHE_TTL', 'CACHE_PARTITION_TRIGGER', 'EMBEDDING_API_KEY', 'EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'REASONING_EFFORT'],
     int: ['MAX_MEMORIES_INJECT', 'MAX_CONVERSATIONS_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'EMBEDDING_DIM',
-          'MEMORY_RECALL_QUERY_ROUNDS', 'MEMORY_CORE_ALWAYS_INJECT'],
+          'MEMORY_RECALL_QUERY_ROUNDS', 'MEMORY_CORE_ALWAYS_INJECT', 'MEMORY_STATE_TTL_DAYS',
+          'MEMORY_EXTRACT_CONTEXT_LIMIT'],
     float: ['MIN_SCORE_THRESHOLD', 'CONVERSATION_MIN_SCORE_THRESHOLD',
             'CONVERSATION_SEEN_TTL_HOURS'],
     bool: ['MEMORY_ENABLED', 'CONVERSATION_RECALL_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM',
@@ -2555,4 +2570,65 @@ async function deleteDiary(id, card) {
     } else {
         alert('删除失败');
     }
+}
+
+
+// ============================================
+// 记忆更新提议
+// ============================================
+const _PROPOSAL_STATUS = {pending: '待处理', accepted: '已采纳', ignored: '已忽略'};
+
+async function loadProposals() {
+    const list = document.getElementById('proposal-list');
+    const status = document.getElementById('proposal-status').value;
+    try {
+        const resp = await fetch('/api/memories/update-proposals?status=' + encodeURIComponent(status));
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || resp.status);
+        document.getElementById('proposal-summary').textContent =
+            `待处理 ${data.pending} 条 · 当前模式 ${data.mode}`;
+        const badge = document.getElementById('proposal-badge');
+        if (badge) {
+            badge.style.display = data.pending ? 'inline' : 'none';
+            badge.textContent = data.pending ? `(${data.pending})` : '';
+        }
+        list.innerHTML = '';
+        if (!data.items.length) {
+            list.textContent = status === 'pending' ? '没有待处理的提议。' : '没有记录。';
+            return;
+        }
+        for (const item of data.items) {
+            const card = document.createElement('div');
+            card.style.cssText = 'padding: 12px 0; border-bottom: 1px solid var(--border-color, #eee);';
+            const oldState = item.old_active === false ? '（旧记忆已归档）' : '';
+            const newState = item.new_active === false ? '（新记忆已归档）' : '';
+            const actions = item.status === 'pending'
+                ? `<button class="btn btn-primary btn-sm" data-act="accept">采纳</button>
+                   <button class="btn btn-sm" data-act="ignore">忽略</button>`
+                : `<span style="font-size:12px;color:var(--text-muted);">${escHtml(_PROPOSAL_STATUS[item.status] || item.status)} ${escHtml(item.resolved_at || '')}</span>`;
+            card.innerHTML = `
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;">
+                    <span style="font-size:12px;color:var(--text-muted);">${escHtml(item.created_at || '')} · 来源 ${escHtml(item.source || '')} · 打算用 #${item.new_memory_id} 取代 #${item.old_memory_id}</span>
+                    <div style="display:flex;gap:6px;">${actions}</div>
+                </div>
+                <div style="font-size:13px;"><b>旧 #${item.old_memory_id}</b>${escHtml(oldState)}：<span style="text-decoration:line-through;opacity:.75;">${escHtml(item.old_content || '')}</span></div>
+                <div style="font-size:13px;margin-top:4px;"><b>新 #${item.new_memory_id}</b>${escHtml(newState)}：${escHtml(item.new_content || '')}</div>`;
+            card.querySelectorAll('button[data-act]').forEach(btn => {
+                btn.addEventListener('click', () => resolveProposal(item.id, btn.dataset.act));
+            });
+            list.appendChild(card);
+        }
+    } catch (e) {
+        list.textContent = '加载失败: ' + e.message;
+    }
+}
+
+async function resolveProposal(id, act) {
+    if (act === 'accept' && !confirm('采纳后旧记忆会被归档（可以在已归档里恢复）。确定？')) return;
+    const resp = await fetch(`/api/memories/update-proposals/${id}/${act}`, { method: 'POST' });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+        alert('操作失败: ' + (data.error || resp.status));
+    }
+    loadProposals();
 }

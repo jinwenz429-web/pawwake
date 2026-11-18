@@ -200,7 +200,7 @@ class ToolRoundTripTests(unittest.IsolatedAsyncioTestCase):
             saved.append({"role": role, "content": content, "metadata": metadata})
             return 100 + len(saved)
 
-        async def extract(messages, existing_memories=None):
+        async def extract(messages, existing_memories=None, **kwargs):
             extraction_windows.append(messages)
             return [{"content": "她想 2027 年春天去京都看樱花", "importance": 7,
                      "source_ids": [101], "kind": "plan"}]
