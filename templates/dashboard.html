@@ -535,9 +535,30 @@
                         <input type="number" id="set-MAX_MEMORIES_INJECT" class="input" min="1" max="50">
                     </div>
                     <div class="settings-field">
+                        <label>常驻核心记忆条数 (MEMORY_CORE_ALWAYS_INJECT)</label>
+                        <input type="number" id="set-MEMORY_CORE_ALWAYS_INJECT" class="input" min="0" max="30">
+                        <small class="form-hint">每轮固定带上 importance 最高的几条核心记忆（layer 3），排在检索结果前面并去重；0 = 不常驻。默认 8</small>
+                    </div>
+                    <div class="settings-field">
+                        <label>召回搜索词轮数 (MEMORY_RECALL_QUERY_ROUNDS)</label>
+                        <input type="number" id="set-MEMORY_RECALL_QUERY_ROUNDS" class="input" min="1" max="6">
+                        <small class="form-hint">用最近几轮用户消息 + 上一条回复的前 200 字当搜索词；最新一句太短会自动多带一轮。默认 2</small>
+                    </div>
+                    <div class="settings-field">
                         <label>最低分数阈值 (MIN_SCORE_THRESHOLD)</label>
                         <input type="number" id="set-MIN_SCORE_THRESHOLD" class="input" min="0" max="1" step="0.01">
+                        <small class="form-hint">混合模式下，关键词分和向量分是在这一批候选里相对归一化的（最好的那条总被拉到 1），所以这个总分阈值挡不住「整批都不相关」的情况；真正起闸门作用的是「记忆搜索权重」里的语义阈值。</small>
                     </div>
+                    <div class="settings-field settings-toggle-row">
+                        <label>记忆 MCP 服务 (/mcp)</label>
+                        <label class="toggle"><input type="checkbox" id="set-MEMORY_MCP_ENABLED"><span class="toggle-slider"></span></label>
+                    </div>
+                    <small class="form-hint" style="display:block;margin:-6px 0 10px;">让模型自己调 search_memory 查记忆。Kelivo 里添加 MCP 服务器：地址 <code>https://你的域名/mcp</code>，请求头 <code>Authorization: Bearer &lt;GATEWAY_SECRET&gt;</code>。默认开</small>
+                    <div class="settings-field settings-toggle-row">
+                        <label>允许模型写入记忆 (MEMORY_MCP_WRITE_ENABLED)</label>
+                        <label class="toggle"><input type="checkbox" id="set-MEMORY_MCP_WRITE_ENABLED"><span class="toggle-slider"></span></label>
+                    </div>
+                    <small class="form-hint" style="display:block;margin:-6px 0 10px;">开启后多出 remember / update_memory 两个工具，写入走和自动提取一样的去重，来源记为 mcp。默认关</small>
                     <div class="settings-field">
                         <label>提取间隔轮数 (MEMORY_EXTRACT_INTERVAL)</label>
                         <input type="number" id="set-MEMORY_EXTRACT_INTERVAL" class="input" min="0" max="20">
@@ -672,6 +693,7 @@
                     <div class="settings-field">
                         <label>语义阈值 <span class="slider-val" id="val-MEMORY_SEMANTIC_THRESHOLD"></span></label>
                         <input type="range" id="set-MEMORY_SEMANTIC_THRESHOLD" min="0" max="1" step="0.05" oninput="updateSliderVal('MEMORY_SEMANTIC_THRESHOLD')">
+                        <small class="form-hint">向量原始相似度低于它的候选直接丢掉，在归一化之前生效。混合模式下关键词分和向量分是在候选里相对归一化的，真正起闸门作用的是这个语义阈值。</small>
                     </div>
                 </div>
 

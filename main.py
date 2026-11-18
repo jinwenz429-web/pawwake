@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -45,6 +45,8 @@ from database import (
 )
 from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, replace_last_conversation_round, archive_replaced_answer_memories, delete_assistant_rounds, delete_auxiliary_suggestion_messages, delete_redundant_reroll_tail, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
+from database import get_active_memories_count, get_core_memories, get_memory_by_id, compute_valid_until, get_last_user_message_id
+import memory_mcp
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
 from memory_rebuilder import (
@@ -107,6 +109,16 @@ CONVERSATION_SEEN_TTL_HOURS = max(
     0.0,
     float(os.getenv("CONVERSATION_SEEN_TTL_HOURS", "6")),
 )
+
+# 召回搜索词用最近几轮用户消息（加上一条 assistant 回复的前 200 字）
+MEMORY_RECALL_QUERY_ROUNDS = max(1, int(os.getenv("MEMORY_RECALL_QUERY_ROUNDS", "2")))
+
+# 记忆 MCP 服务（/mcp）：只读工具默认开；写入工具（remember / update_memory）默认关
+MEMORY_MCP_ENABLED = os.getenv("MEMORY_MCP_ENABLED", "true").lower() == "true"
+MEMORY_MCP_WRITE_ENABLED = os.getenv("MEMORY_MCP_WRITE_ENABLED", "false").lower() == "true"
+
+# 每轮固定注入的核心记忆条数（layer 3，按 importance 取最高的几条），0 = 不常驻
+MEMORY_CORE_ALWAYS_INJECT = max(0, int(os.getenv("MEMORY_CORE_ALWAYS_INJECT", "8")))
 
 # 记忆提取间隔（0 = 禁用自动提取，1 = 每轮提取，N = 每 N 轮提取一次）
 MEMORY_EXTRACT_INTERVAL = int(os.getenv("MEMORY_EXTRACT_INTERVAL", "1"))
@@ -346,6 +358,10 @@ async def lifespan(app: FastAPI):
                     "MAX_MEMORIES_INJECT": int, "MAX_CONVERSATIONS_INJECT": int,
                     "CONVERSATION_SEEN_TTL_HOURS": lambda v: max(0.0, float(v)),
                     "MEMORY_EXTRACT_INTERVAL": int,
+                    "MEMORY_RECALL_QUERY_ROUNDS": lambda v: max(1, int(v)),
+                    "MEMORY_CORE_ALWAYS_INJECT": lambda v: max(0, int(v)),
+                    "MEMORY_MCP_ENABLED": lambda v: _parse_bool(v),
+                    "MEMORY_MCP_WRITE_ENABLED": lambda v: _parse_bool(v),
                     "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
                     "CACHE_PARTITION_X": int, "CACHE_PARTITION_TRIGGER": str,
                     "CACHE_PARTITION_WINDOW": int, "CACHE_SUMMARY_MODEL": str,
@@ -566,47 +582,225 @@ async def gateway_auth_middleware(request: Request, call_next):
 # 记忆注入
 # ============================================================
 
-def _format_memory_line(mem: dict) -> str:
-    date_value = ""
-    if mem.get("event_date"):
-        # 事件日期本身是本地日期，不做时区换算。
-        date_value = str(mem["event_date"])[:10]
-    elif mem.get("created_at"):
-        try:
-            utc_str = str(mem["created_at"])[:19]
-            utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            local_dt = utc_dt + timedelta(hours=TIMEZONE_HOURS)
-            date_value = local_dt.strftime("%Y-%m-%d")
-        except Exception:
-            date_value = str(mem["created_at"])[:10]
-    date_prefix = f"发生日期：{date_value}；" if date_value else ""
-    return f"- {date_prefix}{mem['content']}"
+_INJECTED_BLOCK_RE = re.compile(
+    r"<(retrieved_memories|retrieved_conversations|gateway_context|core_memories)>.*?</\1>",
+    re.DOTALL,
+)
+_QUERY_PUNCT_RE = re.compile(r"[\W_]+", re.UNICODE)
+RECALL_QUERY_ASSISTANT_CHARS = 200
+RECALL_QUERY_SHORT_CHARS = 4
+
+
+def _query_text(message: dict) -> str:
+    """消息里能拿来当搜索词的文字：去掉网关自己注入的块。"""
+    return _INJECTED_BLOCK_RE.sub("", _message_text(message) or "").strip()
+
+
+def build_recall_query(messages: list, rounds: int = 2) -> str:
+    """召回搜索词：最近 rounds 轮用户消息 + 上一条 assistant 回复的前 200 字。
+
+    Kelivo 主动醒来的隐藏提示不是用户说的话，直接跳过；最新一句太短
+    （去标点后不到 4 个字）时多带一轮前文。
+    """
+    rounds = max(1, int(rounds or 1))
+    picked = []          # (index, text)
+    assistant_pick = None
+    want = rounds
+    for index in range(len(messages or []) - 1, -1, -1):
+        message = messages[index]
+        role = message.get("role")
+        if role == "assistant" and assistant_pick is None:
+            text = _query_text(message)
+            if text:
+                assistant_pick = (index, text[:RECALL_QUERY_ASSISTANT_CHARS])
+            continue
+        if role != "user":
+            continue
+        text = _query_text(message)
+        if not text or companion_turns.is_proactive_cue(text):
+            continue
+        if not picked and len(_QUERY_PUNCT_RE.sub("", text)) < RECALL_QUERY_SHORT_CHARS:
+            want = rounds + 1
+        picked.append((index, text))
+        if len(picked) >= want:
+            break
+    if assistant_pick is not None:
+        picked.append(assistant_pick)
+    picked.sort(key=lambda item: item[0])
+    return "\n".join(text for _, text in picked)
+
+
+MEMORY_KIND_LABELS = {
+    "fact": "事实",
+    "state": "状态",
+    "event": "事件",
+    "plan": "计划",
+    "promise": "约定",
+}
+
+
+def _local_today():
+    return (datetime.now(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()
+
+
+def _as_date(value):
+    """DATE 字段（event_date / valid_until）：本身就是本地日期，不做时区换算。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if hasattr(value, "year") and hasattr(value, "day"):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _local_date_of(value):
+    """TIMESTAMPTZ 字段（created_at）换成本地日期；不带时区的按 UTC 处理。"""
+    if value is None or value == "":
+        return None
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (dt.astimezone(timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()
+    except (TypeError, ValueError):
+        return _as_date(value)
+
+
+def _relative_days(target, today) -> str:
+    days = (today - target).days
+    if days == 0:
+        return "今天"
+    if days > 0:
+        return f"{days} 天前"
+    return f"还有 {-days} 天"
+
+
+def _format_memory_line(mem: dict, today=None) -> str:
+    """一条记忆的注入格式，日期和「几天前」由代码算好：
+
+    - [2026-11-18｜1 天前｜事件] 内容
+    - [计划 2026-12-20｜还有 31 天] 内容
+    - [记于 2026-11-01｜17 天前｜事实] 内容      ← 没有 event_date 时用记录日期
+    没有 kind 的旧记忆不显示类型，其余照常。
+    """
+    today = today or _local_today()
+    kind = str(mem.get("kind") or "").strip().lower() or None
+    label = MEMORY_KIND_LABELS.get(kind)
+    event_date = _as_date(mem.get("event_date"))
+    recorded = _local_date_of(mem.get("created_at"))
+    valid_until = _as_date(mem.get("valid_until"))
+
+    if kind == "plan" and event_date:
+        head = f"计划 {event_date.isoformat()}｜{_relative_days(event_date, today)}"
+    elif event_date:
+        head = f"{event_date.isoformat()}｜{_relative_days(event_date, today)}"
+        if label:
+            head += f"｜{label}"
+    elif recorded:
+        head = f"记于 {recorded.isoformat()}｜{_relative_days(recorded, today)}"
+        if label:
+            head += f"｜{label}"
+    else:
+        head = label or ""
+
+    note = ""
+    if kind == "state" and valid_until and today > valid_until:
+        as_of = event_date or recorded
+        if as_of:
+            note = f"（这是 {as_of.isoformat()} 时的状态，可能已经变了）"
+    elif kind == "plan" and event_date:
+        expired = today > valid_until if valid_until else today > event_date
+        if expired:
+            note = f"（原定 {event_date.isoformat()}，已过去）"
+
+    content = str(mem.get("content") or "")
+    prefix = f"- [{head}] " if head else "- "
+    return f"{prefix}{content}{note}"
+
+
+async def _load_core_memories() -> list:
+    if not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED or MEMORY_CORE_ALWAYS_INJECT <= 0:
+        return []
+    try:
+        return await get_core_memories(MEMORY_CORE_ALWAYS_INJECT)
+    except Exception as e:
+        print(f"⚠️ 读取核心记忆失败（本轮不常驻）: {e}")
+        return []
+
+
+def format_core_memory_block(core_memories: list, today=None) -> str:
+    if not core_memories:
+        return ""
+    lines = [_format_memory_line(mem, today) for mem in core_memories]
+    return (
+        "<core_memories>\n"
+        "以下是关于对方最重要、长期稳定的记忆，网关每轮固定附上：\n"
+        + "\n".join(lines)
+        + "\n</core_memories>"
+    )
+
+
+async def search_memories_excluding(query: str, limit: int, exclude_ids=None) -> list:
+    """检索记忆并去掉已经常驻注入的那几条（多搜几条补回被去掉的名额）。"""
+    if not query or not query.strip() or limit <= 0:
+        return []
+    exclude = {int(value) for value in (exclude_ids or [])}
+    results = await search_memories(query, limit=limit + len(exclude))
+    kept = [mem for mem in results if int(mem["id"]) not in exclude] if exclude else list(results)
+    return kept[:limit]
+
+
+MEMORY_DATE_GUIDE = (
+    "- 每条记忆开头方括号里的日期和「几天前 / 还有几天」是网关按今天算好的，以它为准；"
+    "判断「最近」「上次」时看隔了几天，不要照搬记忆原文里「昨天」「最近」之类的说法"
+)
 
 
 async def build_system_prompt_with_memories(user_message: str, base_prompt: str) -> str:
     """
-    构建带记忆的 system prompt
-    1. 用用户消息搜索相关记忆
-    2. 格式化成文本拼接到人设后面
+    构建带记忆的 system prompt（非分区模式）
+    1. 核心记忆常驻（importance 最高的几条 layer 3）
+    2. 用搜索词检索相关记忆，和核心记忆去重
+    3. 格式化成文本拼接到人设后面
     """
     if not MEMORY_ENABLED or not MEMORY_EXTRACT_ENABLED:
         return base_prompt
     
-    if MAX_MEMORIES_INJECT <= 0:
+    if MAX_MEMORIES_INJECT <= 0 and MEMORY_CORE_ALWAYS_INJECT <= 0:
         return base_prompt
     
     try:
-        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
+        core = await _load_core_memories()
+        memories = await search_memories_excluding(
+            user_message, MAX_MEMORIES_INJECT, [mem["id"] for mem in core],
+        ) if MAX_MEMORIES_INJECT > 0 else []
         
-        if not memories:
+        if not memories and not core:
             return base_prompt
         
-        memory_lines = [_format_memory_line(mem) for mem in memories]
-        memory_text = "\n".join(memory_lines)
+        today = _local_today()
+        sections = []
+        if core:
+            sections.append(
+                "【关于对方的核心记忆（每轮都在）】\n"
+                + "\n".join(_format_memory_line(mem, today) for mem in core)
+            )
+        if memories:
+            sections.append(
+                "【从过往对话中检索到的相关记忆】\n"
+                + "\n".join(_format_memory_line(mem, today) for mem in memories)
+            )
+        memory_text = "\n\n".join(sections)
         
         enhanced_prompt = f"""{base_prompt}
 
-【从过往对话中检索到的相关记忆】
 {memory_text}
 
 # 记忆应用
@@ -615,6 +809,7 @@ async def build_system_prompt_with_memories(user_message: str, base_prompt: str)
 - 对重要信息（如健康、日期、约定）保持一致性
 - 新信息与记忆冲突时，以新信息为准
 - 模糊记忆可表达不确定性："记得你似乎说过..."
+{MEMORY_DATE_GUIDE}
 
 # 交流方式
 - 自然引用："记得你说过..."或"上次我们聊到..."
@@ -623,7 +818,7 @@ async def build_system_prompt_with_memories(user_message: str, base_prompt: str)
 
 记忆是丰富对话的工具，而非对话焦点。"""
         
-        print(f"📚 注入了 {len(memories)} 条相关记忆")
+        print(f"📚 注入了 {len(core)} 条核心记忆 + {len(memories)} 条相关记忆")
         return enhanced_prompt
         
     except Exception as e:
@@ -809,7 +1004,8 @@ MEMORY_USAGE_GUIDE = """
 - 模糊记忆可表达不确定性："记得你似乎说过..."
 - 不得输出 citation、source、reference、来源标签、引用标签或 [cite:...] 等来源标记
 - 记忆中的发生日期仅用于内部判断时间先后，不是来源标记；不应在回答中复现，也不得转换为引用或来源标签
-"""
+- system 里的 <core_memories> 块是关于对方最重要的长期记忆，每轮都在
+""" + MEMORY_DATE_GUIDE + "\n"
 
 
 def build_time_injection() -> str:
@@ -1121,6 +1317,53 @@ def find_deleted_assistant_rounds(db_messages: list, client_messages: list) -> l
     ]
 
 
+_extraction_locks = weakref.WeakValueDictionary()
+
+
+def _extraction_lock(session_id: str) -> asyncio.Lock:
+    """同一会话的记忆提取串行跑：用户连发几条时，后一次能看到前一次刚记下的内容。"""
+    lock = _extraction_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _extraction_locks[session_id] = lock
+    return lock
+
+
+# 只拦真正在讨论记忆系统本身的内容；项目进度里常见的「部署」「bug」「数据库」等不拦
+META_BLACKLIST = [
+    "记忆库", "记忆系统", "没有被记录", "没有被提取", "尚未被记录", "记忆遗漏", "检索",
+]
+
+
+def _verified_memory_sources(memory: dict, messages_for_extraction: list):
+    """核对提取结果的来源：编号要在这次截取范围内，且至少有一条是用户说的。
+
+    例外：AI 对用户做出的承诺、约定（kind=promise）允许只有 AI 自己的消息作来源。
+    返回核对过的编号列表；不合格返回 None。
+    """
+    roles = {}
+    for message in messages_for_extraction:
+        source_id = message.get("source_id")
+        if isinstance(source_id, int) and not isinstance(source_id, bool):
+            roles[source_id] = message.get("role")
+    cited = set()
+    for raw_id in (memory.get("source_ids") or []):
+        if isinstance(raw_id, bool):
+            continue
+        try:
+            source_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if source_id in roles:
+            cited.add(source_id)
+    if not cited:
+        return None
+    has_user = any(roles[source_id] == "user" for source_id in cited)
+    if not has_user and (memory.get("kind") or "") != "promise":
+        return None
+    return sorted(cited)
+
+
 def _build_memory_extraction_messages(
     context_messages: list,
     assistant_msg: str,
@@ -1222,6 +1465,7 @@ async def build_partitioned_messages(
     user_message: str,
     conversation_recall_text: str = "",
     active_tool_call_ids: set | None = None,
+    memory_exclude_ids=None,
 ) -> list:
     deadline = time.monotonic() + CACHE_SUMMARY_BUDGET_SECONDS
     lock = _partition_build_lock(session_id)
@@ -1234,11 +1478,13 @@ async def build_partitioned_messages(
         return await _build_partitioned_messages(
             session_id, all_messages, base_prompt, user_message,
             conversation_recall_text, active_tool_call_ids, summary_deadline=deadline,
+            memory_exclude_ids=memory_exclude_ids,
         )
     try:
         return await _build_partitioned_messages(
             session_id, all_messages, base_prompt, user_message,
             conversation_recall_text, active_tool_call_ids, summary_deadline=deadline,
+            memory_exclude_ids=memory_exclude_ids,
         )
     finally:
         lock.release()
@@ -1252,6 +1498,7 @@ async def _build_partitioned_messages(
     conversation_recall_text: str = "",
     active_tool_call_ids: set | None = None,
     *, summary_deadline: float,
+    memory_exclude_ids=None,
 ) -> list:
     """
     分区缓存模式：构建带breakpoint的messages数组。
@@ -1326,6 +1573,7 @@ async def _build_partitioned_messages(
             current_user_msg,
             summary_parts,
             conversation_recall_text,
+            memory_exclude_ids=memory_exclude_ids,
         )
     
     # 计算A/B区（按逻辑轮切片）
@@ -1457,7 +1705,7 @@ async def _build_partitioned_messages(
         parts = [build_time_injection()]
         
         if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
-            mem_text = await build_memory_text(user_message)
+            mem_text = await build_memory_text(user_message, memory_exclude_ids)
             if mem_text:
                 parts.append(mem_text)
 
@@ -1481,6 +1729,7 @@ async def _build_basic_cached(
     current_user_msg: dict,
     summary_parts: list = None,
     conversation_recall_text: str = "",
+    memory_exclude_ids=None,
 ) -> list:
     """基础版prompt caching（历史不够分区时的降级模式）"""
     summary_parts = summary_parts or []
@@ -1523,7 +1772,7 @@ async def _build_basic_cached(
         parts = [build_time_injection()]
         
         if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
-            mem_text = await build_memory_text(user_message)
+            mem_text = await build_memory_text(user_message, memory_exclude_ids)
             if mem_text:
                 parts.append(mem_text)
 
@@ -1538,16 +1787,17 @@ async def _build_basic_cached(
     return result
 
 
-async def build_memory_text(user_message: str) -> str:
-    """搜索记忆并格式化为注入文本（分区缓存模式用）"""
+async def build_memory_text(user_message: str, exclude_ids=None) -> str:
+    """搜索记忆并格式化为注入文本（分区缓存模式用）。exclude_ids 是已常驻的核心记忆。"""
     if MAX_MEMORIES_INJECT <= 0:
         return ""
     try:
-        memories = await search_memories(user_message, limit=MAX_MEMORIES_INJECT)
+        memories = await search_memories_excluding(user_message, MAX_MEMORIES_INJECT, exclude_ids)
         if not memories:
             return ""
         
-        memory_lines = [_format_memory_line(mem) for mem in memories]
+        today = _local_today()
+        memory_lines = [_format_memory_line(mem, today) for mem in memories]
         
         print(f"📚 注入了 {len(memories)} 条相关记忆")
         return (
@@ -1579,6 +1829,29 @@ def _format_recall_timestamp(raw_ts) -> str:
         return str(raw_ts)[:10]
 
 
+def _format_fragment_results(results) -> tuple[list, list]:
+    """把 search_chat_fragments 的结果排成文字块，返回 (blocks, fragment_ids)。"""
+    blocks = []
+    fragment_ids = []
+    role_labels = {"user": "用户", "assistant": "AI", "tool": "工具"}
+    for result in results or []:
+        for fragment, fragment_id in zip(
+            result.get("fragments", []),
+            result.get("fragment_ids", []),
+        ):
+            lines = []
+            for message in fragment:
+                date_prefix = ""
+                if message.get("created_at"):
+                    date_prefix = f"[{_format_recall_timestamp(message['created_at'])}] "
+                role = role_labels.get(message.get("role"), message.get("role", "消息"))
+                lines.append(f"{date_prefix}{role}: {message.get('content', '')}")
+            if lines and fragment_id:
+                blocks.append("\n".join(lines))
+                fragment_ids.append(fragment_id)
+    return blocks, fragment_ids
+
+
 async def build_conversation_recall_text(user_message: str, session_id: str):
     """为分区模式检索未注入过的对话片段，并返回待确认的 fragment_id。"""
     if (
@@ -1604,24 +1877,7 @@ async def build_conversation_recall_text(user_message: str, session_id: str):
         if not results:
             return "", []
 
-        blocks = []
-        fragment_ids = []
-        role_labels = {"user": "用户", "assistant": "AI", "tool": "工具"}
-        for result in results:
-            for fragment, fragment_id in zip(
-                result.get("fragments", []),
-                result.get("fragment_ids", []),
-            ):
-                lines = []
-                for message in fragment:
-                    date_prefix = ""
-                    if message.get("created_at"):
-                        date_prefix = f"[{_format_recall_timestamp(message['created_at'])}] "
-                    role = role_labels.get(message.get("role"), message.get("role", "消息"))
-                    lines.append(f"{date_prefix}{role}: {message.get('content', '')}")
-                if lines and fragment_id:
-                    blocks.append("\n".join(lines))
-                    fragment_ids.append(fragment_id)
+        blocks, fragment_ids = _format_fragment_results(results)
 
         if not blocks:
             return "", []
@@ -1647,8 +1903,15 @@ async def store_proactive_reply(
     model: str,
     assistant_reasoning: str = None,
     persist_conversation: bool = True,
+    tool_messages: list = None,
+    assistant_tool_calls: list = None,
 ):
-    """Kelivo 主动回合：日记进日记表，回复本身只存助手这一条；静默就什么都不存。"""
+    """Kelivo 主动回合：日记进日记表，回复本身只存助手这一条；静默就什么都不存。
+
+    醒来时模型也可能先调工具（比如 search_memory）：工具调用和工具结果照常存档，
+    否则分区模式下一个请求会以为库里没有在等工具结果，把客户端送来的结果丢掉。
+    隐藏提示本身仍然不存，也不做记忆提取。
+    """
     rest, diaries = companion_turns.split_diary(assistant_msg or "")
     for body in diaries:
         try:
@@ -1662,11 +1925,116 @@ async def store_proactive_reply(
         print(f"📔 主动回合写了 {len(diaries)} 篇日记", flush=True)
     if not persist_conversation:
         return
+    for tool_message in [tm for tm in (tool_messages or []) if tm.get("content")]:
+        meta_dict = {}
+        if tool_message.get("tool_call_id"):
+            meta_dict["tool_call_id"] = tool_message["tool_call_id"]
+        if tool_message.get("name"):
+            meta_dict["name"] = tool_message["name"]
+        await save_message(session_id, "tool", tool_message.get("content", ""), model,
+                           metadata=json.dumps(meta_dict) if meta_dict else None)
+    if assistant_tool_calls:
+        meta_dict = {"tool_calls": assistant_tool_calls}
+        if assistant_reasoning:
+            meta_dict["reasoning_content"] = assistant_reasoning
+        await save_message(session_id, "assistant", rest or "", model, metadata=json.dumps(meta_dict))
+        print(f"🔧 主动回合调用了 {len(assistant_tool_calls)} 个工具，已存档等待结果", flush=True)
+        return
     if not rest or companion_turns.is_silence(rest):
         print("🤫 主动回合选择静默，不存对话", flush=True)
         return
     metadata = json.dumps({"reasoning_content": assistant_reasoning}) if assistant_reasoning else None
     await save_message(session_id, "assistant", rest, model, metadata=metadata)
+
+
+async def _extract_and_store_memories(
+    session_id: str,
+    user_msg: str,
+    assistant_msg: str,
+    context_messages: list,
+    stored_user_id,
+    stored_assistant_id,
+    guard_meta,
+):
+    """提取 + 入库。调用方负责拿按 session 的锁。"""
+    # 3. 获取已有记忆，传给提取模型做对比去重
+    existing = await get_recent_memories(limit=80)
+    existing_contents = [r["content"] for r in existing]
+    
+    # 4. 按逻辑轮截取近期上下文，而非发送完整会话。
+    if context_messages:
+        extraction_context = [dict(message) for message in context_messages]
+        if stored_user_id:
+            for message in reversed(extraction_context):
+                if message.get("role") == "user" and not message.get("source_id"):
+                    message["source_id"] = stored_user_id
+                    break
+        messages_for_extraction, selected_round_count = (
+            _build_memory_extraction_messages(
+                extraction_context,
+                assistant_msg,
+                MEMORY_EXTRACT_INTERVAL,
+                stored_assistant_id,
+            )
+        )
+        print(
+            f"📝 截取最近 {selected_round_count} 个逻辑轮提取记忆"
+            f"（{len(messages_for_extraction)} 条 user/assistant 消息）"
+        )
+    else:
+        messages_for_extraction = [
+            {"role": "user", "content": user_msg, "source_id": stored_user_id},
+            {"role": "assistant", "content": assistant_msg, "source_id": stored_assistant_id},
+        ]
+    
+    if guard_meta is not None:
+        messages_for_extraction = persona_guard.filter_extraction_messages(messages_for_extraction)
+    new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
+    
+    # 过滤垃圾记忆（不靠模型自觉，硬过滤）
+    filtered_memories = []
+    rejected_meta = 0
+    rejected_source = 0
+    for mem in new_memories:
+        content = mem["content"]
+        if any(kw in content for kw in META_BLACKLIST):
+            print(f"🚫 过滤掉meta记忆: {content[:60]}...")
+            rejected_meta += 1
+            continue
+        verified = _verified_memory_sources(mem, messages_for_extraction)
+        if not verified:
+            print(f"🚫 跳过来源不合格的提取结果（没有用户消息作来源）: {content[:60]}")
+            rejected_source += 1
+            continue
+        mem["verified_source_ids"] = verified
+        filtered_memories.append(mem)
+
+    dedup_stats = {"inserted": 0, "updated": 0, "skipped": 0}
+    for mem in filtered_memories:
+        result = await save_memory_deduplicated(
+            content=mem["content"],
+            importance=mem["importance"],
+            source_session=session_id,
+            source_message_ids=mem["verified_source_ids"],
+        )
+        action = result.get("action", "skipped")
+        dedup_stats[action] = dedup_stats.get(action, 0) + 1
+        if action == "skipped" and result.get("reason"):
+            print(
+                f"🧹 跳过重复记忆: reason={result['reason']}, "
+                f"matched_id={result.get('matched_id')}"
+            )
+    
+    if new_memories:
+        total = await get_active_memories_count()
+        print(
+            "💾 记忆处理完成："
+            f"新增 {dedup_stats['inserted']}，"
+            f"升级 {dedup_stats['updated']}，"
+            f"去重跳过 {dedup_stats['skipped']}，"
+            f"meta过滤 {rejected_meta}，来源不合格 {rejected_source}，"
+            f"总计 {total} 条（活跃）"
+        )
 
 
 async def process_memories_background(
@@ -1815,7 +2183,13 @@ async def process_memories_background(
                 await save_message(session_id, "tool", tm.get("content", ""), model, metadata=meta)
 
             if user_msg and context_messages and context_messages[-1].get("role") == "user":
-                await save_message(session_id, "user", user_msg, model)
+                stored_user_id = await save_message(session_id, "user", user_msg, model)
+            elif user_msg:
+                # 这一轮的 user 在发起工具调用那个请求里已经存过，找回编号给提取核对来源
+                try:
+                    stored_user_id = await get_last_user_message_id(session_id, user_msg)
+                except Exception as e:
+                    print(f"⚠️ 找回 user 消息编号失败: {e}")
             
             if assistant_msg or assistant_tool_calls:
                 ast_meta_dict = {}
@@ -1905,105 +2279,203 @@ async def process_memories_background(
         if MEMORY_EXTRACT_INTERVAL > 1:
             print(f"📝 {round_scope} 第 {current_round_count} 轮，执行记忆提取")
         
-        # 3. 获取已有记忆，传给提取模型做对比去重
-        existing = await get_recent_memories(limit=80)
-        existing_contents = [r["content"] for r in existing]
-        
-        # 4. 按逻辑轮截取近期上下文，而非发送完整会话。
-        if context_messages:
-            extraction_context = [dict(message) for message in context_messages]
-            if stored_user_id:
-                for message in reversed(extraction_context):
-                    if message.get("role") == "user" and not message.get("source_id"):
-                        message["source_id"] = stored_user_id
-                        break
-            messages_for_extraction, selected_round_count = (
-                _build_memory_extraction_messages(
-                    extraction_context,
-                    assistant_msg,
-                    MEMORY_EXTRACT_INTERVAL,
-                    stored_assistant_id,
-                )
+        async with _extraction_lock(session_id):
+            await _extract_and_store_memories(
+                session_id, user_msg, assistant_msg, context_messages,
+                stored_user_id, stored_assistant_id, guard_meta,
             )
-            print(
-                f"📝 截取最近 {selected_round_count} 个逻辑轮提取记忆"
-                f"（{len(messages_for_extraction)} 条 user/assistant 消息）"
-            )
-        else:
-            messages_for_extraction = [
-                {"role": "user", "content": user_msg, "source_id": stored_user_id},
-                {"role": "assistant", "content": assistant_msg, "source_id": stored_assistant_id},
-            ]
-        
-        if guard_meta is not None:
-            messages_for_extraction = persona_guard.filter_extraction_messages(messages_for_extraction)
-        new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
-        allowed_source_ids = {
-            message.get("source_id") for message in messages_for_extraction
-            if isinstance(message.get("source_id"), int)
-            and not isinstance(message.get("source_id"), bool)
-        }
-        
-        # 过滤垃圾记忆（不靠模型自觉，硬过滤）
-        META_BLACKLIST = [
-            "记忆库", "记忆系统", "检索", "没有被记录", "没有被提取",
-            "记忆遗漏", "尚未被记录", "写入不完整", "检索功能",
-            "系统没有返回", "关键词匹配", "语义匹配", "语义检索",
-            "阈值", "数据库", "seed", "导入", "部署",
-            "bug", "debug", "端口", "网关",
-        ]
-        
-        filtered_memories = []
-        for mem in new_memories:
-            content = mem["content"]
-            if any(kw in content for kw in META_BLACKLIST):
-                print(f"🚫 过滤掉meta记忆: {content[:60]}...")
-                continue
-            cited_ids = set()
-            for raw_id in (mem.get("source_ids") or []):
-                if isinstance(raw_id, bool):
-                    continue
-                try:
-                    source_id = int(raw_id)
-                except (TypeError, ValueError):
-                    continue
-                if source_id in allowed_source_ids:
-                    cited_ids.add(source_id)
-            if not cited_ids:
-                print("🚫 跳过无可核验消息来源的提取结果")
-                continue
-            mem["verified_source_ids"] = sorted(cited_ids)
-            filtered_memories.append(mem)
-        
-        dedup_stats = {"inserted": 0, "updated": 0, "skipped": 0}
-        for mem in filtered_memories:
-            result = await save_memory_deduplicated(
-                content=mem["content"],
-                importance=mem["importance"],
-                source_session=session_id,
-                source_message_ids=mem["verified_source_ids"],
-            )
-            action = result.get("action", "skipped")
-            dedup_stats[action] = dedup_stats.get(action, 0) + 1
-            if action == "skipped" and result.get("reason"):
-                print(
-                    f"🧹 跳过重复记忆: reason={result['reason']}, "
-                    f"matched_id={result.get('matched_id')}"
-                )
-        
-        if filtered_memories:
-            total = await get_all_memories_count()
-            print(
-                "💾 记忆处理完成："
-                f"新增 {dedup_stats['inserted']}，"
-                f"升级 {dedup_stats['updated']}，"
-                f"去重跳过 {dedup_stats['skipped']}，"
-                f"meta过滤 {len(new_memories) - len(filtered_memories)}，"
-                f"总计 {total} 条"
-            )
-            
+
     except Exception as e:
         print(f"⚠️  后台记忆处理失败: {e}")
+
+
+# ============================================================
+# 记忆 MCP 服务（/mcp）
+# ============================================================
+
+MCP_SEARCH_HINT = (
+    "\n\n# 记忆工具\n"
+    "- 自动带上的记忆只是一部分。想不起来、或需要确认某件事、某个日期、某个约定时，"
+    "调用 search_memory 工具去查，不要凭印象编。"
+)
+
+
+def _request_has_tool(body: dict, name: str) -> bool:
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        tool_name = (tool.get("function") or {}).get("name") or tool.get("name") or ""
+        if isinstance(tool_name, str) and tool_name.endswith(name):
+            return True
+    return False
+
+
+def _parse_tool_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value).strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        raise memory_mcp.ToolInputError("event_date 要写成 YYYY-MM-DD")
+
+
+async def _mcp_search_memory(query: str, limit: int) -> str:
+    if not MEMORY_ENABLED:
+        return "记忆系统没有开启。"
+    memories = await search_memories(query, limit=limit)
+    if not memories:
+        return "没有查到相关记忆。"
+    today = _local_today()
+    lines = []
+    for mem in memories:
+        line = _format_memory_line(mem, today)
+        if MEMORY_MCP_WRITE_ENABLED:
+            line += f"（记忆 #{mem['id']}）"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def _mcp_recall_conversation(query: str, limit: int) -> str:
+    results, _ = await search_chat_fragments(
+        query, max_sessions=limit, max_matches_per_session=1, context=1, mode="hybrid",
+    )
+    blocks, _ = _format_fragment_results(results)
+    if not blocks:
+        return "没有找到相关的聊天片段。"
+    return "\n\n".join(blocks)
+
+
+async def _mcp_remember(content: str, kind: str, event_date_text: str | None) -> str:
+    if not MEMORY_ENABLED:
+        return "记忆系统没有开启。"
+    event_date = _parse_tool_date(event_date_text)
+    if any(word in content for word in META_BLACKLIST):
+        return "这条是在讨论记忆系统本身，没有记。"
+    result = await save_memory_deduplicated(
+        content=content,
+        importance=6,
+        source_session="mcp",
+        kind=kind,
+        event_date=event_date,
+        valid_until=compute_valid_until(kind, event_date, _local_today()),
+    )
+    action = result.get("action")
+    print(f"🧩 MCP remember: action={action}, id={result.get('memory_id')}", flush=True)
+    if action == "inserted":
+        return f"记下了（记忆 #{result['memory_id']}）。"
+    if action == "updated":
+        return f"和已有的记忆 #{result['memory_id']} 是一回事，已经用更完整的说法更新。"
+    return f"已经有一样的记忆了（记忆 #{result.get('matched_id')}），没有重复记。"
+
+
+async def _mcp_update_memory(target_id: int, content: str) -> str:
+    if not MEMORY_ENABLED:
+        return "记忆系统没有开启。"
+    target = await get_memory_by_id(target_id)
+    if not target or not target.get("is_active") or target.get("superseded_by"):
+        raise memory_mcp.ToolInputError(f"记忆 #{target_id} 不存在或已经归档")
+    kind = target.get("kind")
+    result = await save_memory_deduplicated(
+        content=content,
+        importance=int(target.get("importance") or 6),
+        source_session="mcp",
+        kind=kind,
+        event_date=target.get("event_date"),
+        valid_until=compute_valid_until(kind, target.get("event_date"), _local_today()),
+    )
+    new_id = result.get("memory_id")
+    # 取代逻辑（MEMORY_UPDATE_MODE）在下一个版本接上；现在只记新条、不动旧条
+    print(f"🧩 MCP update_memory: 打算用 #{new_id} 取代 #{target_id}（暂不改动旧条）", flush=True)
+    if result.get("action") == "inserted":
+        return f"已记下新的现状（记忆 #{new_id}）；旧记忆 #{target_id} 暂时保留，等人工确认后再归档。"
+    return f"新内容和已有记忆 #{result.get('matched_id')} 重复，没有新增；旧记忆 #{target_id} 未改动。"
+
+
+MEMORY_TOOLSET = memory_mcp.MemoryToolset(
+    search=_mcp_search_memory,
+    recall=_mcp_recall_conversation,
+    remember=_mcp_remember,
+    update=_mcp_update_memory,
+    recall_enabled=lambda: bool(_db_module.CONVERSATION_RECALL_ENABLED),
+    write_enabled=lambda: bool(MEMORY_MCP_WRITE_ENABLED),
+)
+
+
+def _mcp_unavailable():
+    if not MEMORY_MCP_ENABLED:
+        return JSONResponse(status_code=404, content={"error": "记忆 MCP 服务没有开启（MEMORY_MCP_ENABLED）"})
+    if not GATEWAY_SECRET:
+        # 中间件在没设密钥时会放行所有请求；记忆不能这样裸奔
+        return JSONResponse(status_code=503, content={"error": "需要先设置 GATEWAY_SECRET 才能用 /mcp"})
+    return None
+
+
+@app.post("/mcp")
+async def mcp_streamable_http(request: Request):
+    """Streamable HTTP：一次 POST 一条（或一批）JSON-RPC，直接回 JSON。"""
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={
+            "jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"},
+        })
+    response = await memory_mcp.handle_payload(MEMORY_TOOLSET, payload)
+    if response is None:
+        return Response(status_code=202)
+    return JSONResponse(content=response)
+
+
+@app.get("/mcp")
+async def mcp_get_stream():
+    """不提供服务端主动推送的流（规范允许回 405）。"""
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.delete("/mcp")
+async def mcp_delete_session():
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.get("/mcp/sse")
+async def mcp_sse(request: Request):
+    """旧版 HTTP+SSE 传输：先建流，再往 endpoint 事件给出的地址 POST。"""
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    session_id, queue = memory_mcp.SSE_SESSIONS.open()
+    endpoint = f"/mcp/messages?session_id={session_id}"
+    return StreamingResponse(
+        memory_mcp.sse_stream(session_id, queue, endpoint, request.is_disconnected),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/mcp/messages")
+async def mcp_sse_messages(request: Request, session_id: str = ""):
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    queue = memory_mcp.SSE_SESSIONS.get(session_id)
+    if queue is None:
+        return JSONResponse(status_code=404, content={"error": "SSE 会话不存在或已断开"})
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Parse error"})
+    response = await memory_mcp.handle_payload(MEMORY_TOOLSET, payload)
+    if response is not None:
+        await queue.put(response)
+    return Response(status_code=202)
 
 
 # ============================================================
@@ -2512,24 +2984,35 @@ async def _chat_completions_inner(request: Request):
         print(f"📦 分区模式: DB历史{len(db_msgs)}条 + 客户端消息{len(client_new_msgs)}条")
         
         partition_prompt = resolved_system_prompt
-        if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and MAX_MEMORIES_INJECT > 0:
+        core_memories = await _load_core_memories()
+        if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and (MAX_MEMORIES_INJECT > 0 or core_memories):
             partition_prompt = (resolved_system_prompt or "") + MEMORY_USAGE_GUIDE
+        # 核心记忆很少变：放进 system（第一个缓存断点之前），检索结果仍放在当前 user 消息里
+        core_block = format_core_memory_block(core_memories)
+        if core_block:
+            partition_prompt = ((partition_prompt or "") + "\n\n" + core_block).strip()
+        if MEMORY_ENABLED and _request_has_tool(body, "search_memory"):
+            partition_prompt = (partition_prompt or "") + MCP_SEARCH_HINT
         # 保留客户端自带的 system（工具说明等），拼接到网关 prompt 之后，
         # 与非分区路径的行为对齐（前端 system 稳定时不影响 BP1 缓存命中）
         client_system_text = _extract_client_system_text(messages)
         if client_system_text:
             partition_prompt = ((partition_prompt or "") + "\n\n" + client_system_text).strip()
+        # 召回搜索词：最近几轮真实对话（主动回合的隐藏提示会被跳过）
+        recall_query = build_recall_query(all_msgs, MEMORY_RECALL_QUERY_ROUNDS)
+        conversation_query = recall_query if proactive_turn else user_message
         try:
             conversation_recall_text, pending_fragment_ids = (
-                await build_conversation_recall_text(user_message, session_id)
+                await build_conversation_recall_text(conversation_query, session_id)
             )
             messages = await build_partitioned_messages(
                 session_id,
                 all_msgs,
                 partition_prompt,
-                user_message,
+                recall_query,
                 conversation_recall_text,
                 active_tool_call_ids=active_tool_call_ids,
+                memory_exclude_ids=[mem["id"] for mem in core_memories],
             )
         except Exception as e:
             print(f"❌ 分区缓存不可用：读取轮转状态失败: {e}")
@@ -2546,14 +3029,18 @@ async def _chat_completions_inner(request: Request):
     
     else:
         # ---------- 原有逻辑：system prompt + 记忆注入 ----------
-        if not skip_conversation_log and (resolved_system_prompt or (MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message)):
-            if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and user_message:
+        # 召回搜索词：最近几轮真实对话（主动回合的隐藏提示会被跳过）
+        recall_query = build_recall_query(original_messages, MEMORY_RECALL_QUERY_ROUNDS)
+        if not skip_conversation_log and (resolved_system_prompt or (MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED)):
+            if MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED:
                 enhanced_prompt = await build_system_prompt_with_memories(
-                    user_message,
+                    recall_query,
                     resolved_system_prompt,
                 )
             else:
                 enhanced_prompt = resolved_system_prompt
+            if enhanced_prompt and MEMORY_ENABLED and _request_has_tool(body, "search_memory"):
+                enhanced_prompt += MCP_SEARCH_HINT
             
             if enhanced_prompt:
                 has_system = any(msg.get("role") == "system" for msg in messages)
@@ -2693,6 +3180,8 @@ async def _chat_completions_inner(request: Request):
                     asyncio.create_task(store_proactive_reply(
                         session_id, assistant_msg, model, assistant_reasoning,
                         persist_conversation=conversation_persistence_enabled(),
+                        tool_messages=tool_messages,
+                        assistant_tool_calls=assistant_tool_calls,
                     ))
                 elif conversation_persistence_enabled() and (user_message or tool_messages):
                     asyncio.create_task(
@@ -2930,6 +3419,8 @@ async def stream_and_capture(
         asyncio.create_task(store_proactive_reply(
             session_id, assistant_msg, model, assistant_reasoning,
             persist_conversation=conversation_persistence_enabled(),
+            tool_messages=tool_messages,
+            assistant_tool_calls=assistant_tool_calls,
         ))
     elif stream_succeeded and conversation_persistence_enabled() and (user_message or tool_messages):
         asyncio.create_task(
@@ -2983,8 +3474,12 @@ async def export_memories():
             if mem.get("event_date"):
                 mem["event_date"] = str(mem["event_date"])
 
+        for mem in memories:
+            if mem.get("valid_until"):
+                mem["valid_until"] = str(mem["valid_until"])
+
         return {
-            "schema_version": 2,
+            "schema_version": _db_module.BACKUP_SCHEMA_VERSION,
             "total": len(memories),
             "exported_at": str(__import__("datetime").datetime.now()),
             "memories": memories,
@@ -3931,9 +4426,9 @@ async def import_memories(request: Request):
             return {"error": "没有找到记忆数据，请确认 JSON 格式正确"}
 
         # v2 版本化备份：完整恢复三层结构、日期和合并关系
-        if data.get("schema_version") == 2:
+        if data.get("schema_version") in (2, 3):
             try:
-                return await import_memories_v2(memories)
+                return await import_memories_v2(memories, schema_version=data["schema_version"])
             except ValueError as e:
                 return {"error": f"备份校验失败：{e}"}
 
@@ -4642,6 +5137,10 @@ async def get_settings():
             ),
             "MIN_SCORE_THRESHOLD":     float(db.get("MIN_SCORE_THRESHOLD") or _db_module.MIN_SCORE_THRESHOLD),
             "MEMORY_EXTRACT_INTERVAL": int(db.get("MEMORY_EXTRACT_INTERVAL") or MEMORY_EXTRACT_INTERVAL),
+            "MEMORY_RECALL_QUERY_ROUNDS": int(db.get("MEMORY_RECALL_QUERY_ROUNDS") or MEMORY_RECALL_QUERY_ROUNDS),
+            "MEMORY_CORE_ALWAYS_INJECT": int(db.get("MEMORY_CORE_ALWAYS_INJECT") or MEMORY_CORE_ALWAYS_INJECT),
+            "MEMORY_MCP_ENABLED": _parse_bool(db.get("MEMORY_MCP_ENABLED"), MEMORY_MCP_ENABLED),
+            "MEMORY_MCP_WRITE_ENABLED": _parse_bool(db.get("MEMORY_MCP_WRITE_ENABLED"), MEMORY_MCP_WRITE_ENABLED),
 
             # 缓存分区
             "CACHE_PARTITION_ENABLED": _parse_bool(db.get("CACHE_PARTITION_ENABLED"), CACHE_PARTITION_ENABLED),
@@ -4717,6 +5216,10 @@ async def save_settings(request: Request):
             "MAX_CONVERSATIONS_INJECT": int,
             "CONVERSATION_SEEN_TTL_HOURS": lambda v: max(0.0, float(v)),
             "MEMORY_EXTRACT_INTERVAL": int,
+            "MEMORY_RECALL_QUERY_ROUNDS": lambda v: max(1, int(v)),
+            "MEMORY_CORE_ALWAYS_INJECT": lambda v: max(0, int(v)),
+            "MEMORY_MCP_ENABLED":    lambda v: _parse_bool(v),
+            "MEMORY_MCP_WRITE_ENABLED": lambda v: _parse_bool(v),
             "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
             "CACHE_PARTITION_X":     int,
             "CACHE_PARTITION_TRIGGER": str,

@@ -62,6 +62,10 @@ MEMORY_HW_IMPORTANCE = float(os.getenv("MEMORY_HW_IMPORTANCE", "0.15"))
 MEMORY_HW_RECENCY = float(os.getenv("MEMORY_HW_RECENCY", "0.15"))
 MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.5"))
 
+# state 类记忆的有效期：记录日 + N 天（plan 固定是 event_date + 3 天）
+MEMORY_STATE_TTL_DAYS = int(os.getenv("MEMORY_STATE_TTL_DAYS", "14"))
+PLAN_GRACE_DAYS = 3
+
 
 # ============================================================
 # 连接池管理
@@ -283,6 +287,12 @@ async def init_tables():
             END $$;
         """)
         
+        # kind: fact/state/event/plan/promise；valid_until: 状态/计划的有效期（代码算，不让模型算）
+        # superseded_by: 被哪条新记忆取代（记在旧条上），不为空就不再召回
+        await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT NULL")
+        await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_until DATE DEFAULT NULL")
+        await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by INTEGER DEFAULT NULL")
+
         # 三层记忆索引
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_layer ON memories (layer);
@@ -984,6 +994,23 @@ async def get_last_user_content(session_id: str) -> str:
         return row['content'] if row else ""
 
 
+async def get_last_user_message_id(session_id: str, content: str = None):
+    """工具结果轮次里 user 消息在上一个请求已经存过：找回它的编号，给记忆提取核对来源用。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, content FROM conversations
+            WHERE session_id = $1 AND role = 'user' AND is_superseded = FALSE
+            ORDER BY id DESC
+            LIMIT 1
+        """, session_id)
+    if not row:
+        return None
+    if content is not None and (row["content"] or "") != content:
+        return None
+    return int(row["id"])
+
+
 async def update_last_assistant_message(session_id: str, new_content: str, model: str = ""):
     """覆盖指定session最后一条assistant消息的content（用于re-roll去重）"""
     pool = await get_pool()
@@ -1600,11 +1627,42 @@ def _is_materially_richer_memory(new_content: str, old_content: str) -> bool:
     return new_len >= old_len + max(8, int(old_len * 0.15))
 
 
+def local_today() -> date:
+    return (datetime.now(dt_timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()
+
+
+def compute_valid_until(kind, event_date=None, recorded_date=None):
+    """valid_until 由代码定，不让模型算：
+    state = 记录日 + MEMORY_STATE_TTL_DAYS；plan = event_date + 3 天；其他为空。"""
+    kind = str(kind or "").strip().lower()
+    if kind == "state":
+        base = recorded_date or local_today()
+        return base + timedelta(days=max(1, int(MEMORY_STATE_TTL_DAYS)))
+    if kind == "plan" and event_date:
+        return event_date + timedelta(days=PLAN_GRACE_DAYS)
+    return None
+
+
+async def get_memory_by_id(memory_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, content, importance, layer, title, is_active, created_at,
+                      event_date, kind, valid_until, superseded_by
+               FROM memories WHERE id = $1""",
+            int(memory_id),
+        )
+        return dict(row) if row else None
+
+
 async def save_memory_deduplicated(content: str, importance: int = 5,
                                    source_session: str = "",
                                    threshold: float = DEFAULT_MEMORY_DEDUP_THRESHOLD,
-                                   source_message_ids: list = None) -> dict:
-    """自动提取专用的原子判重写入。"""
+                                   source_message_ids: list = None,
+                                   kind: str = None,
+                                   event_date: date = None,
+                                   valid_until: date = None) -> dict:
+    """自动提取专用的原子判重写入。kind / event_date / valid_until 只在新插入时写入。"""
     clean_content = str(content or "").strip()
     if not clean_content:
         return {
@@ -1718,12 +1776,16 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                     }
             else:
                 row = await conn.fetchrow(
-                    """INSERT INTO memories (content, importance, source_session)
-                       VALUES ($1, $2, $3)
+                    """INSERT INTO memories (content, importance, source_session,
+                                             kind, event_date, valid_until)
+                       VALUES ($1, $2, $3, $4, $5, $6)
                        RETURNING id""",
                     clean_content,
                     int(importance),
                     source_session,
+                    _normalize_kind(kind),
+                    event_date,
+                    valid_until,
                 )
                 memory_id = int(row["id"]) if row else None
                 embedding_refresh_id = memory_id
@@ -1900,7 +1962,7 @@ async def search_memories(query: str, limit: int = 10):
         
         # 至少命中一个关键词（只搜索活跃记忆）
         where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
-        where_clause = f"is_active = TRUE AND ({' OR '.join(where_parts)})"
+        where_clause = f"is_active = TRUE AND superseded_by IS NULL AND ({' OR '.join(where_parts)})"
         
         limit_idx = len(keywords) + 1
         params.append(limit)
@@ -1915,6 +1977,7 @@ async def search_memories(query: str, limit: int = 10):
         sql = f"""
             SELECT
                 id, content, importance, created_at, event_date,
+                kind, valid_until, layer,
                 ({hit_count_expr}) AS hit_count,
                 ({recency_days_expr}) AS effective_days,
                 (
@@ -1993,13 +2056,14 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
             hit_count_expr = " + ".join(case_parts)
             max_hits = len(keywords)
             where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
-            where_clause = f"is_active = TRUE AND ({' OR '.join(where_parts)})"
+            where_clause = f"is_active = TRUE AND superseded_by IS NULL AND ({' OR '.join(where_parts)})"
             
             limit_idx = len(keywords) + 1
             params.append(limit * 3)
             
             kw_sql = f"""
                 SELECT id, content, importance, created_at, event_date,
+                       kind, valid_until, layer,
                        ({hit_count_expr}) AS hit_count,
                        ({hit_count_expr})::float / {max_hits}.0 AS kw_score
                 FROM memories
@@ -2015,6 +2079,9 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
                     'importance': r['importance'],
                     'created_at': r['created_at'],
                     'event_date': r['event_date'],
+                    'kind': r['kind'],
+                    'valid_until': r['valid_until'],
+                    'layer': r['layer'],
                     'hit_count': r['hit_count'],
                     'kw_score': float(r['kw_score']),
                     'similarity': 0.0,
@@ -2026,17 +2093,21 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
                 vec_str = '[' + ','.join(str(f) for f in query_embedding) + ']'
                 sem_rows = await conn.fetch("""
                     SELECT id, content, importance, created_at, event_date,
+                           kind, valid_until, layer,
                            1 - (embedding <=> $1::vector) as similarity
                     FROM memories
                     WHERE embedding IS NOT NULL AND is_active = TRUE
+                      AND superseded_by IS NULL
                     ORDER BY embedding <=> $1::vector
                     LIMIT $2
                 """, vec_str, limit * 3)
             else:
                 # Python端计算cosine
                 all_mem = await conn.fetch("""
-                    SELECT id, content, importance, created_at, event_date, embedding_json
+                    SELECT id, content, importance, created_at, event_date,
+                           kind, valid_until, layer, embedding_json
                     FROM memories WHERE embedding_json IS NOT NULL AND is_active = TRUE
+                      AND superseded_by IS NULL
                 """)
                 
                 scored = []
@@ -2063,6 +2134,9 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
                         'importance': r['importance'],
                         'created_at': r['created_at'],
                         'event_date': r['event_date'],
+                        'kind': r.get('kind'),
+                        'valid_until': r.get('valid_until'),
+                        'layer': r.get('layer'),
                         'hit_count': 0,
                         'kw_score': 0.0,
                         'similarity': sim,
@@ -2105,6 +2179,9 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
                 'importance': info['importance'],
                 'created_at': info['created_at'],
                 'event_date': info.get('event_date'),
+                'kind': info.get('kind'),
+                'valid_until': info.get('valid_until'),
+                'layer': info.get('layer'),
                 'hit_count': info['hit_count'],
                 'similarity': info['similarity'],
                 'score': score,
@@ -2163,7 +2240,10 @@ async def get_pending_memory_embedding_count():
 
 
 async def backfill_memory_embeddings(batch_size: int = 20):
-    """给已有记忆补算embedding（没有embedding的记忆）"""
+    """给已有记忆补算embedding（没有embedding的记忆）
+
+    覆盖所有没有向量的记忆（活跃的排在前面，归档的也会补，恢复后直接可用）。
+    """
     if not EMBEDDING_API_KEY:
         print("⚠️ EMBEDDING_API_KEY 未设置，无法补算embedding")
         return 0
@@ -2176,14 +2256,14 @@ async def backfill_memory_embeddings(batch_size: int = 20):
             rows = await conn.fetch("""
                 SELECT id, content FROM memories 
                 WHERE embedding IS NULL AND content IS NOT NULL
-                ORDER BY id
+                ORDER BY (is_active IS TRUE) DESC, id
                 LIMIT $1
             """, batch_size)
         else:
             rows = await conn.fetch("""
                 SELECT id, content FROM memories 
                 WHERE embedding_json IS NULL AND content IS NOT NULL
-                ORDER BY id
+                ORDER BY (is_active IS TRUE) DESC, id
                 LIMIT $1
             """, batch_size)
     
@@ -2444,11 +2524,39 @@ async def get_recent_memories(limit: int = 20):
         )
 
 
+async def get_core_memories(limit: int = 8):
+    """常驻注入用的核心记忆：活跃、未被取代的 layer 3，按 importance 取最高的几条。
+
+    排序固定（importance 降序、id 升序），内容不变时每轮拼出来的文字完全一样，
+    不会破坏提示词缓存。
+    """
+    if not limit or limit <= 0:
+        return []
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, content, importance, created_at, event_date,
+                      kind, valid_until, layer, title
+               FROM memories
+               WHERE is_active = TRUE AND layer = 3 AND superseded_by IS NULL
+               ORDER BY importance DESC, id ASC
+               LIMIT $1""",
+            int(limit),
+        )
+        return [dict(row) for row in rows]
+
+
 async def get_all_memories_count():
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT COUNT(*) as cnt FROM memories")
         return row["cnt"]
+
+
+async def get_active_memories_count():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM memories WHERE is_active = TRUE")
 
 
 async def get_all_memories():
@@ -2460,7 +2568,8 @@ async def get_all_memories():
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, content, importance, source_session, created_at,
-                   layer, title, is_active, merged_from, event_date
+                   layer, title, is_active, merged_from, event_date,
+                   kind, valid_until, superseded_by
             FROM memories ORDER BY id
         """)
         memories = [dict(r) for r in rows]
@@ -2538,8 +2647,19 @@ def _parse_backup_date(value):
         return None
 
 
-async def import_memories_v2(memories: list):
-    """恢复 v2 版本化备份：单事务两遍，先插入建映射，再回填合并关系。
+MEMORY_KINDS = ("fact", "state", "event", "plan", "promise")
+BACKUP_SCHEMA_VERSION = 3
+
+
+def _normalize_kind(value):
+    kind = str(value or "").strip().lower()
+    return kind if kind in MEMORY_KINDS else None
+
+
+async def import_memories_v2(memories: list, schema_version: int = 2):
+    """恢复 v2/v3 版本化备份：单事务两遍，先插入建映射，再回填合并/取代关系。
+
+    v3 比 v2 多 kind / valid_until / superseded_by；v2 备份里没有这几项，按空值导入。
 
     - 同内容且库中唯一 → 跳过并映射到已有行（同一份备份重复导入幂等）
     - 同内容但库中多行 → 不猜挂哪条，计入 conflicts 回执，引用它的合并链降级
@@ -2598,8 +2718,9 @@ async def import_memories_v2(memories: list):
                     continue
                 row = await conn.fetchrow("""
                     INSERT INTO memories (content, importance, source_session, created_at,
-                                          layer, title, is_active, event_date)
-                    VALUES ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8)
+                                          layer, title, is_active, event_date,
+                                          kind, valid_until)
+                    VALUES ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8, $9, $10)
                     RETURNING id
                 """,
                     content,
@@ -2610,6 +2731,8 @@ async def import_memories_v2(memories: list):
                     mem.get("title") or "",
                     bool(mem.get("is_active", True)),
                     _parse_backup_date(mem.get("event_date")),
+                    _normalize_kind(mem.get("kind")),
+                    _parse_backup_date(mem.get("valid_until")),
                 )
                 id_map[bid] = int(row["id"])
                 imported += 1
@@ -2634,10 +2757,26 @@ async def import_memories_v2(memories: list):
                     [id_map[ref] for ref in refs], new_id,
                 )
 
+            # ---- 第三遍：回填 superseded_by（v3）。指向的条目不在备份里就留空并回执 ----
+            for mem in memories:
+                ref = mem.get("superseded_by")
+                if ref is None or isinstance(ref, bool) or not isinstance(ref, int):
+                    continue
+                new_id = id_map.get(mem["backup_id"])
+                if new_id is None:
+                    continue
+                if ref not in id_map:
+                    degraded.append({"backup_id": mem["backup_id"], "unresolved_superseded_by": ref})
+                    continue
+                await conn.execute(
+                    "UPDATE memories SET superseded_by = $1 WHERE id = $2",
+                    id_map[ref], new_id,
+                )
+
     total = await get_all_memories_count()
     result = {
         "status": "done",
-        "schema_version": 2,
+        "schema_version": schema_version,
         "imported": imported,
         "skipped": skipped,
         "conflicts": conflicts,
@@ -2686,7 +2825,8 @@ async def get_all_memories_detail(limit: int = None, layer: int = None, active_o
         
         rows = await conn.fetch(f"""
             SELECT id, content, importance, source_session, created_at,
-                   layer, title, is_active, merged_from, event_date
+                   layer, title, is_active, merged_from, event_date,
+                   kind, valid_until, superseded_by
             FROM memories
             {where_clause}
             ORDER BY id

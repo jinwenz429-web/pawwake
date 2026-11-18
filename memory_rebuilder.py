@@ -9,6 +9,7 @@ from collections import defaultdict
 import httpx
 
 import memory_extractor as _me
+import database as _db
 from database import get_pool
 
 REBUILD_BATCH_SIZE = int(os.getenv("MEMORY_REBUILD_BATCH_SIZE", "25"))
@@ -274,6 +275,8 @@ SYNTHESIZE_PROMPT = """你正在把同一领域的长期记忆候选整理成最
 - DISCARD：结合上下文后确认没有长期价值，允许一条或多条。
 
 关键规则：
+0. KEEP 表示原样保留那一条：不许改写 content（输出的 content 会被忽略，原文原样留在库里），
+   只能调整 title、importance、target_layer。
 1. 同一广泛主题下的不同事实不要硬合并；只有真正属于同一概念/同一事件才合并。
 2. 稳定事实默认 layer=3；情景事件 layer=2。
 3. 输出 content 必须自包含、凝练，但不要把有情绪意义的事件压成空洞标签。
@@ -307,7 +310,7 @@ def _validate_actions(source_ids, actions):
             raise ValueError("KEEP 只能覆盖一条来源")
         if action == "MERGE" and len(ids) < 2:
             raise ValueError("MERGE 至少需要两条来源")
-        if action != "DISCARD" and not str(raw.get("content", "")).strip():
+        if action in {"MERGE", "EVENT"} and not str(raw.get("content", "")).strip():
             raise ValueError(f"{action} 缺少 content")
         for memory_id in ids:
             if memory_id not in expected or memory_id in seen:
@@ -351,7 +354,13 @@ async def _synthesize_once(candidates, label):
         SYNTHESIZE_PROMPT.replace("{items}", _json_text(payload)),
         label,
     )
-    return _validate_actions(source_ids, result)
+    actions = _validate_actions(source_ids, result)
+    # KEEP 不许改写：预览里显示的就是库里那条原文，免得看着像改过
+    by_id = {item["id"]: item for item in candidates}
+    for action in actions:
+        if action["action"] == "KEEP":
+            action["content"] = by_id[action["source_ids"][0]]["source"]["content"]
+    return actions
 
 
 async def _synthesize_domain(candidates, domain):
@@ -385,11 +394,20 @@ async def _synthesize_domain(candidates, domain):
                 "content": action["content"],
             },
             "_original_source_ids": action["source_ids"],
+            "_provisional_action": action,
         })
 
     if pseudo:
         reconciled = await _synthesize_once(pseudo, f"跨批次归并:{domain}")
         for action in reconciled:
+            if action["action"] == "KEEP":
+                # 跨批次 KEEP = 保留上一轮那个动作本身（可能是 MERGE/EVENT），只采纳新的标题和分数
+                item = next(p for p in pseudo if p["id"] == action["source_ids"][0])
+                provisional = dict(item["_provisional_action"])
+                provisional["title"] = action["title"] or provisional["title"]
+                provisional["importance"] = action["importance"]
+                final.append(provisional)
+                continue
             original_ids = []
             for synthetic_id in action["source_ids"]:
                 item = next(p for p in pseudo if p["id"] == synthetic_id)
@@ -640,6 +658,7 @@ def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int) 
     actions = _validate_actions(expected_ids, plan.get("actions") or [])
     archive_ids = []
     kept_ids = []
+    keep_updates = []
     creates = []
     for action in actions:
         ids = action["source_ids"]
@@ -647,13 +666,20 @@ def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int) 
             archive_ids.extend(ids)
             continue
         if action["action"] == "KEEP":
+            # KEEP 一律原地保留那一行：id、created_at、content、embedding 都不动，
+            # 最多更新 title / importance / layer
             source = source_map[ids[0]]
-            if (source["content"] == action["content"]
-                    and int(source["layer"] or 1) == action["target_layer"]
-                    and (source["title"] or "") == action["title"]
-                    and int(source["importance"] or 5) == action["importance"]):
-                kept_ids.append(ids[0])
-                continue
+            kept_ids.append(ids[0])
+            if ((source["title"] or "") != action["title"]
+                    or int(source["importance"] or 5) != action["importance"]
+                    or int(source["layer"] or 1) != action["target_layer"]):
+                keep_updates.append({
+                    "id": ids[0],
+                    "title": action["title"] or (source["title"] or ""),
+                    "importance": action["importance"],
+                    "layer": action["target_layer"],
+                })
+            continue
         archive_ids.extend(ids)
         dates = []
         for source_id in ids:
@@ -672,6 +698,7 @@ def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int) 
     return {
         "archive_ids": sorted(archive_ids),
         "kept_ids": sorted(kept_ids),
+        "keep_updates": keep_updates,
         "creates": creates,
     }
 
@@ -710,7 +737,15 @@ async def apply_memory_rebuild_plan(plan_id: int, confirmed_plan_id: int) -> dic
                 if int(command.split()[-1]) != len(archive_ids):
                     raise RebuildApplyConflict("归档数量不一致，整批操作已回滚")
 
+            for item in prepared["keep_updates"]:
+                await conn.execute(
+                    """UPDATE memories SET title = $2, importance = $3, layer = $4
+                       WHERE id = $1 AND is_active = TRUE""",
+                    item["id"], item["title"], item["importance"], item["layer"],
+                )
+
             created_ids = []
+            created_contents = []
             for item in prepared["creates"]:
                 new_id = await conn.fetchval(
                     """INSERT INTO memories
@@ -724,12 +759,14 @@ async def apply_memory_rebuild_plan(plan_id: int, confirmed_plan_id: int) -> dic
                 if new_id is None:
                     raise RuntimeError("创建整理记忆失败，整批操作已回滚")
                 created_ids.append(int(new_id))
+                created_contents.append(item["content"])
 
             result = {
                 "status": "applied",
                 "plan_id": plan_id,
                 "archived": len(archive_ids),
                 "kept": len(prepared["kept_ids"]),
+                "kept_updated": len(prepared["keep_updates"]),
                 "created": len(created_ids),
                 "created_ids": created_ids,
             }
@@ -741,4 +778,21 @@ async def apply_memory_rebuild_plan(plan_id: int, confirmed_plan_id: int) -> dic
             )
     if _status.get("plan_id") == plan_id:
         _status["phase"] = "applied"
+    await _embed_created_memories(list(zip(created_ids, created_contents)))
     return result
+
+
+async def _embed_created_memories(items):
+    """事务提交后再算向量：和 create_consolidated_events / merge_memories 一样，
+    失败只记日志，不回滚已经应用的方案（漏掉的可以用「补算向量」补上）。"""
+    if not _db.MEMORY_VECTOR_ENABLED or not items:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        for memory_id, content in items:
+            try:
+                embedding = await _db.compute_embedding(content)
+                if embedding:
+                    await _db.save_memory_embedding(conn, memory_id, embedding)
+            except Exception as exc:
+                print(f"⚠️ 整理新建记忆 embedding 计算失败（id={memory_id}）: {exc}", flush=True)
