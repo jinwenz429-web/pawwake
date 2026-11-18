@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -45,7 +45,8 @@ from database import (
 )
 from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, replace_last_conversation_round, archive_replaced_answer_memories, delete_assistant_rounds, delete_auxiliary_suggestion_messages, delete_redundant_reroll_tail, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
-from database import get_active_memories_count, get_core_memories
+from database import get_active_memories_count, get_core_memories, get_memory_by_id, compute_valid_until, get_last_user_message_id
+import memory_mcp
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
 from memory_rebuilder import (
@@ -111,6 +112,10 @@ CONVERSATION_SEEN_TTL_HOURS = max(
 
 # 召回搜索词用最近几轮用户消息（加上一条 assistant 回复的前 200 字）
 MEMORY_RECALL_QUERY_ROUNDS = max(1, int(os.getenv("MEMORY_RECALL_QUERY_ROUNDS", "2")))
+
+# 记忆 MCP 服务（/mcp）：只读工具默认开；写入工具（remember / update_memory）默认关
+MEMORY_MCP_ENABLED = os.getenv("MEMORY_MCP_ENABLED", "true").lower() == "true"
+MEMORY_MCP_WRITE_ENABLED = os.getenv("MEMORY_MCP_WRITE_ENABLED", "false").lower() == "true"
 
 # 每轮固定注入的核心记忆条数（layer 3，按 importance 取最高的几条），0 = 不常驻
 MEMORY_CORE_ALWAYS_INJECT = max(0, int(os.getenv("MEMORY_CORE_ALWAYS_INJECT", "8")))
@@ -355,6 +360,8 @@ async def lifespan(app: FastAPI):
                     "MEMORY_EXTRACT_INTERVAL": int,
                     "MEMORY_RECALL_QUERY_ROUNDS": lambda v: max(1, int(v)),
                     "MEMORY_CORE_ALWAYS_INJECT": lambda v: max(0, int(v)),
+                    "MEMORY_MCP_ENABLED": lambda v: _parse_bool(v),
+                    "MEMORY_MCP_WRITE_ENABLED": lambda v: _parse_bool(v),
                     "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
                     "CACHE_PARTITION_X": int, "CACHE_PARTITION_TRIGGER": str,
                     "CACHE_PARTITION_WINDOW": int, "CACHE_SUMMARY_MODEL": str,
@@ -1822,6 +1829,29 @@ def _format_recall_timestamp(raw_ts) -> str:
         return str(raw_ts)[:10]
 
 
+def _format_fragment_results(results) -> tuple[list, list]:
+    """把 search_chat_fragments 的结果排成文字块，返回 (blocks, fragment_ids)。"""
+    blocks = []
+    fragment_ids = []
+    role_labels = {"user": "用户", "assistant": "AI", "tool": "工具"}
+    for result in results or []:
+        for fragment, fragment_id in zip(
+            result.get("fragments", []),
+            result.get("fragment_ids", []),
+        ):
+            lines = []
+            for message in fragment:
+                date_prefix = ""
+                if message.get("created_at"):
+                    date_prefix = f"[{_format_recall_timestamp(message['created_at'])}] "
+                role = role_labels.get(message.get("role"), message.get("role", "消息"))
+                lines.append(f"{date_prefix}{role}: {message.get('content', '')}")
+            if lines and fragment_id:
+                blocks.append("\n".join(lines))
+                fragment_ids.append(fragment_id)
+    return blocks, fragment_ids
+
+
 async def build_conversation_recall_text(user_message: str, session_id: str):
     """为分区模式检索未注入过的对话片段，并返回待确认的 fragment_id。"""
     if (
@@ -1847,24 +1877,7 @@ async def build_conversation_recall_text(user_message: str, session_id: str):
         if not results:
             return "", []
 
-        blocks = []
-        fragment_ids = []
-        role_labels = {"user": "用户", "assistant": "AI", "tool": "工具"}
-        for result in results:
-            for fragment, fragment_id in zip(
-                result.get("fragments", []),
-                result.get("fragment_ids", []),
-            ):
-                lines = []
-                for message in fragment:
-                    date_prefix = ""
-                    if message.get("created_at"):
-                        date_prefix = f"[{_format_recall_timestamp(message['created_at'])}] "
-                    role = role_labels.get(message.get("role"), message.get("role", "消息"))
-                    lines.append(f"{date_prefix}{role}: {message.get('content', '')}")
-                if lines and fragment_id:
-                    blocks.append("\n".join(lines))
-                    fragment_ids.append(fragment_id)
+        blocks, fragment_ids = _format_fragment_results(results)
 
         if not blocks:
             return "", []
@@ -2148,7 +2161,13 @@ async def process_memories_background(
                 await save_message(session_id, "tool", tm.get("content", ""), model, metadata=meta)
 
             if user_msg and context_messages and context_messages[-1].get("role") == "user":
-                await save_message(session_id, "user", user_msg, model)
+                stored_user_id = await save_message(session_id, "user", user_msg, model)
+            elif user_msg:
+                # 这一轮的 user 在发起工具调用那个请求里已经存过，找回编号给提取核对来源
+                try:
+                    stored_user_id = await get_last_user_message_id(session_id, user_msg)
+                except Exception as e:
+                    print(f"⚠️ 找回 user 消息编号失败: {e}")
             
             if assistant_msg or assistant_tool_calls:
                 ast_meta_dict = {}
@@ -2246,6 +2265,195 @@ async def process_memories_background(
 
     except Exception as e:
         print(f"⚠️  后台记忆处理失败: {e}")
+
+
+# ============================================================
+# 记忆 MCP 服务（/mcp）
+# ============================================================
+
+MCP_SEARCH_HINT = (
+    "\n\n# 记忆工具\n"
+    "- 自动带上的记忆只是一部分。想不起来、或需要确认某件事、某个日期、某个约定时，"
+    "调用 search_memory 工具去查，不要凭印象编。"
+)
+
+
+def _request_has_tool(body: dict, name: str) -> bool:
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        tool_name = (tool.get("function") or {}).get("name") or tool.get("name") or ""
+        if isinstance(tool_name, str) and tool_name.endswith(name):
+            return True
+    return False
+
+
+def _parse_tool_date(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value).strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        raise memory_mcp.ToolInputError("event_date 要写成 YYYY-MM-DD")
+
+
+async def _mcp_search_memory(query: str, limit: int) -> str:
+    if not MEMORY_ENABLED:
+        return "记忆系统没有开启。"
+    memories = await search_memories(query, limit=limit)
+    if not memories:
+        return "没有查到相关记忆。"
+    today = _local_today()
+    lines = []
+    for mem in memories:
+        line = _format_memory_line(mem, today)
+        if MEMORY_MCP_WRITE_ENABLED:
+            line += f"（记忆 #{mem['id']}）"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def _mcp_recall_conversation(query: str, limit: int) -> str:
+    results, _ = await search_chat_fragments(
+        query, max_sessions=limit, max_matches_per_session=1, context=1, mode="hybrid",
+    )
+    blocks, _ = _format_fragment_results(results)
+    if not blocks:
+        return "没有找到相关的聊天片段。"
+    return "\n\n".join(blocks)
+
+
+async def _mcp_remember(content: str, kind: str, event_date_text: str | None) -> str:
+    if not MEMORY_ENABLED:
+        return "记忆系统没有开启。"
+    event_date = _parse_tool_date(event_date_text)
+    if any(word in content for word in META_BLACKLIST):
+        return "这条是在讨论记忆系统本身，没有记。"
+    result = await save_memory_deduplicated(
+        content=content,
+        importance=6,
+        source_session="mcp",
+        kind=kind,
+        event_date=event_date,
+        valid_until=compute_valid_until(kind, event_date, _local_today()),
+    )
+    action = result.get("action")
+    print(f"🧩 MCP remember: action={action}, id={result.get('memory_id')}", flush=True)
+    if action == "inserted":
+        return f"记下了（记忆 #{result['memory_id']}）。"
+    if action == "updated":
+        return f"和已有的记忆 #{result['memory_id']} 是一回事，已经用更完整的说法更新。"
+    return f"已经有一样的记忆了（记忆 #{result.get('matched_id')}），没有重复记。"
+
+
+async def _mcp_update_memory(target_id: int, content: str) -> str:
+    if not MEMORY_ENABLED:
+        return "记忆系统没有开启。"
+    target = await get_memory_by_id(target_id)
+    if not target or not target.get("is_active") or target.get("superseded_by"):
+        raise memory_mcp.ToolInputError(f"记忆 #{target_id} 不存在或已经归档")
+    kind = target.get("kind")
+    result = await save_memory_deduplicated(
+        content=content,
+        importance=int(target.get("importance") or 6),
+        source_session="mcp",
+        kind=kind,
+        event_date=target.get("event_date"),
+        valid_until=compute_valid_until(kind, target.get("event_date"), _local_today()),
+    )
+    new_id = result.get("memory_id")
+    # 取代逻辑（MEMORY_UPDATE_MODE）在下一个版本接上；现在只记新条、不动旧条
+    print(f"🧩 MCP update_memory: 打算用 #{new_id} 取代 #{target_id}（暂不改动旧条）", flush=True)
+    if result.get("action") == "inserted":
+        return f"已记下新的现状（记忆 #{new_id}）；旧记忆 #{target_id} 暂时保留，等人工确认后再归档。"
+    return f"新内容和已有记忆 #{result.get('matched_id')} 重复，没有新增；旧记忆 #{target_id} 未改动。"
+
+
+MEMORY_TOOLSET = memory_mcp.MemoryToolset(
+    search=_mcp_search_memory,
+    recall=_mcp_recall_conversation,
+    remember=_mcp_remember,
+    update=_mcp_update_memory,
+    recall_enabled=lambda: bool(_db_module.CONVERSATION_RECALL_ENABLED),
+    write_enabled=lambda: bool(MEMORY_MCP_WRITE_ENABLED),
+)
+
+
+def _mcp_unavailable():
+    if not MEMORY_MCP_ENABLED:
+        return JSONResponse(status_code=404, content={"error": "记忆 MCP 服务没有开启（MEMORY_MCP_ENABLED）"})
+    if not GATEWAY_SECRET:
+        # 中间件在没设密钥时会放行所有请求；记忆不能这样裸奔
+        return JSONResponse(status_code=503, content={"error": "需要先设置 GATEWAY_SECRET 才能用 /mcp"})
+    return None
+
+
+@app.post("/mcp")
+async def mcp_streamable_http(request: Request):
+    """Streamable HTTP：一次 POST 一条（或一批）JSON-RPC，直接回 JSON。"""
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={
+            "jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"},
+        })
+    response = await memory_mcp.handle_payload(MEMORY_TOOLSET, payload)
+    if response is None:
+        return Response(status_code=202)
+    return JSONResponse(content=response)
+
+
+@app.get("/mcp")
+async def mcp_get_stream():
+    """不提供服务端主动推送的流（规范允许回 405）。"""
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.delete("/mcp")
+async def mcp_delete_session():
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.get("/mcp/sse")
+async def mcp_sse(request: Request):
+    """旧版 HTTP+SSE 传输：先建流，再往 endpoint 事件给出的地址 POST。"""
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    session_id, queue = memory_mcp.SSE_SESSIONS.open()
+    endpoint = f"/mcp/messages?session_id={session_id}"
+    return StreamingResponse(
+        memory_mcp.sse_stream(session_id, queue, endpoint, request.is_disconnected),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/mcp/messages")
+async def mcp_sse_messages(request: Request, session_id: str = ""):
+    blocked = _mcp_unavailable()
+    if blocked:
+        return blocked
+    queue = memory_mcp.SSE_SESSIONS.get(session_id)
+    if queue is None:
+        return JSONResponse(status_code=404, content={"error": "SSE 会话不存在或已断开"})
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Parse error"})
+    response = await memory_mcp.handle_payload(MEMORY_TOOLSET, payload)
+    if response is not None:
+        await queue.put(response)
+    return Response(status_code=202)
 
 
 # ============================================================
@@ -2761,6 +2969,8 @@ async def _chat_completions_inner(request: Request):
         core_block = format_core_memory_block(core_memories)
         if core_block:
             partition_prompt = ((partition_prompt or "") + "\n\n" + core_block).strip()
+        if MEMORY_ENABLED and _request_has_tool(body, "search_memory"):
+            partition_prompt = (partition_prompt or "") + MCP_SEARCH_HINT
         # 保留客户端自带的 system（工具说明等），拼接到网关 prompt 之后，
         # 与非分区路径的行为对齐（前端 system 稳定时不影响 BP1 缓存命中）
         client_system_text = _extract_client_system_text(messages)
@@ -2807,6 +3017,8 @@ async def _chat_completions_inner(request: Request):
                 )
             else:
                 enhanced_prompt = resolved_system_prompt
+            if enhanced_prompt and MEMORY_ENABLED and _request_has_tool(body, "search_memory"):
+                enhanced_prompt += MCP_SEARCH_HINT
             
             if enhanced_prompt:
                 has_system = any(msg.get("role") == "system" for msg in messages)
@@ -4901,6 +5113,8 @@ async def get_settings():
             "MEMORY_EXTRACT_INTERVAL": int(db.get("MEMORY_EXTRACT_INTERVAL") or MEMORY_EXTRACT_INTERVAL),
             "MEMORY_RECALL_QUERY_ROUNDS": int(db.get("MEMORY_RECALL_QUERY_ROUNDS") or MEMORY_RECALL_QUERY_ROUNDS),
             "MEMORY_CORE_ALWAYS_INJECT": int(db.get("MEMORY_CORE_ALWAYS_INJECT") or MEMORY_CORE_ALWAYS_INJECT),
+            "MEMORY_MCP_ENABLED": _parse_bool(db.get("MEMORY_MCP_ENABLED"), MEMORY_MCP_ENABLED),
+            "MEMORY_MCP_WRITE_ENABLED": _parse_bool(db.get("MEMORY_MCP_WRITE_ENABLED"), MEMORY_MCP_WRITE_ENABLED),
 
             # 缓存分区
             "CACHE_PARTITION_ENABLED": _parse_bool(db.get("CACHE_PARTITION_ENABLED"), CACHE_PARTITION_ENABLED),
@@ -4978,6 +5192,8 @@ async def save_settings(request: Request):
             "MEMORY_EXTRACT_INTERVAL": int,
             "MEMORY_RECALL_QUERY_ROUNDS": lambda v: max(1, int(v)),
             "MEMORY_CORE_ALWAYS_INJECT": lambda v: max(0, int(v)),
+            "MEMORY_MCP_ENABLED":    lambda v: _parse_bool(v),
+            "MEMORY_MCP_WRITE_ENABLED": lambda v: _parse_bool(v),
             "CACHE_PARTITION_ENABLED": lambda v: _parse_bool(v),
             "CACHE_PARTITION_X":     int,
             "CACHE_PARTITION_TRIGGER": str,

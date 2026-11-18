@@ -62,6 +62,10 @@ MEMORY_HW_IMPORTANCE = float(os.getenv("MEMORY_HW_IMPORTANCE", "0.15"))
 MEMORY_HW_RECENCY = float(os.getenv("MEMORY_HW_RECENCY", "0.15"))
 MEMORY_SEMANTIC_THRESHOLD = float(os.getenv("MEMORY_SEMANTIC_THRESHOLD", "0.5"))
 
+# state 类记忆的有效期：记录日 + N 天（plan 固定是 event_date + 3 天）
+MEMORY_STATE_TTL_DAYS = int(os.getenv("MEMORY_STATE_TTL_DAYS", "14"))
+PLAN_GRACE_DAYS = 3
+
 
 # ============================================================
 # 连接池管理
@@ -990,6 +994,23 @@ async def get_last_user_content(session_id: str) -> str:
         return row['content'] if row else ""
 
 
+async def get_last_user_message_id(session_id: str, content: str = None):
+    """工具结果轮次里 user 消息在上一个请求已经存过：找回它的编号，给记忆提取核对来源用。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, content FROM conversations
+            WHERE session_id = $1 AND role = 'user' AND is_superseded = FALSE
+            ORDER BY id DESC
+            LIMIT 1
+        """, session_id)
+    if not row:
+        return None
+    if content is not None and (row["content"] or "") != content:
+        return None
+    return int(row["id"])
+
+
 async def update_last_assistant_message(session_id: str, new_content: str, model: str = ""):
     """覆盖指定session最后一条assistant消息的content（用于re-roll去重）"""
     pool = await get_pool()
@@ -1606,11 +1627,42 @@ def _is_materially_richer_memory(new_content: str, old_content: str) -> bool:
     return new_len >= old_len + max(8, int(old_len * 0.15))
 
 
+def local_today() -> date:
+    return (datetime.now(dt_timezone.utc) + timedelta(hours=TIMEZONE_HOURS)).date()
+
+
+def compute_valid_until(kind, event_date=None, recorded_date=None):
+    """valid_until 由代码定，不让模型算：
+    state = 记录日 + MEMORY_STATE_TTL_DAYS；plan = event_date + 3 天；其他为空。"""
+    kind = str(kind or "").strip().lower()
+    if kind == "state":
+        base = recorded_date or local_today()
+        return base + timedelta(days=max(1, int(MEMORY_STATE_TTL_DAYS)))
+    if kind == "plan" and event_date:
+        return event_date + timedelta(days=PLAN_GRACE_DAYS)
+    return None
+
+
+async def get_memory_by_id(memory_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, content, importance, layer, title, is_active, created_at,
+                      event_date, kind, valid_until, superseded_by
+               FROM memories WHERE id = $1""",
+            int(memory_id),
+        )
+        return dict(row) if row else None
+
+
 async def save_memory_deduplicated(content: str, importance: int = 5,
                                    source_session: str = "",
                                    threshold: float = DEFAULT_MEMORY_DEDUP_THRESHOLD,
-                                   source_message_ids: list = None) -> dict:
-    """自动提取专用的原子判重写入。"""
+                                   source_message_ids: list = None,
+                                   kind: str = None,
+                                   event_date: date = None,
+                                   valid_until: date = None) -> dict:
+    """自动提取专用的原子判重写入。kind / event_date / valid_until 只在新插入时写入。"""
     clean_content = str(content or "").strip()
     if not clean_content:
         return {
@@ -1724,12 +1776,16 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                     }
             else:
                 row = await conn.fetchrow(
-                    """INSERT INTO memories (content, importance, source_session)
-                       VALUES ($1, $2, $3)
+                    """INSERT INTO memories (content, importance, source_session,
+                                             kind, event_date, valid_until)
+                       VALUES ($1, $2, $3, $4, $5, $6)
                        RETURNING id""",
                     clean_content,
                     int(importance),
                     source_session,
+                    _normalize_kind(kind),
+                    event_date,
+                    valid_until,
                 )
                 memory_id = int(row["id"]) if row else None
                 embedding_refresh_id = memory_id
