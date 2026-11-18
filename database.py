@@ -750,6 +750,39 @@ async def save_message(session_id: str, role: str, content: str, model: str = ""
     return message_id
 
 
+# 重生成时归档「被替换的那一轮」产生的记忆：
+# - 来源里引用了被替换的回复的（以前就这么做）；
+# - 来源全部落在这一轮里的（包括只引用了用户那句话的）。这一轮会用新回复重新提取，
+#   留着它会在重生成时被原样召回，看起来像用户把同一句话又说了一遍，回复也会往上一版靠。
+# 引用了更早消息的记忆不动。
+ARCHIVE_ROUND_MEMORIES_SQL = """
+    UPDATE memories SET is_active = FALSE
+    WHERE is_active = TRUE AND id IN (
+        SELECT source.memory_id
+        FROM memory_message_sources AS source
+        JOIN conversations AS message ON message.id = source.message_id
+        WHERE message.session_id = $1
+        GROUP BY source.memory_id
+        HAVING bool_or(message.role = 'assistant' AND message.id > $2 AND message.id <= $3)
+            OR bool_and(message.id >= $2 AND message.id <= $3)
+    )
+"""
+
+
+async def get_conversation_tail(session_id: str, limit: int = 80):
+    """取会话最后 limit 条消息（按时间正序），给非分区模式识别重生成用。"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, role, content, metadata, created_at
+            FROM conversations
+            WHERE session_id = $1 AND is_superseded = FALSE
+            ORDER BY id DESC
+            LIMIT $2
+        """, session_id, limit)
+    return [dict(row) for row in reversed(rows)]
+
+
 async def replace_last_conversation_round(
     session_id: str, expected_user_content: str, assistant_content: str,
     model: str = "", metadata: str = None,
@@ -782,15 +815,7 @@ async def replace_last_conversation_round(
             ):
                 return None
             await conn.execute(
-                """UPDATE memories SET is_active = FALSE
-                   WHERE id IN (
-                       SELECT DISTINCT source.memory_id
-                       FROM memory_message_sources AS source
-                       JOIN conversations AS message ON message.id = source.message_id
-                       WHERE message.session_id = $1 AND message.role = 'assistant'
-                         AND message.id > $2 AND message.id <= $3
-                   )""",
-                session_id, user["id"], expected_assistant_id,
+                ARCHIVE_ROUND_MEMORIES_SQL, session_id, user["id"], expected_assistant_id,
             )
             await conn.execute(
                 """DELETE FROM conversations
@@ -828,17 +853,12 @@ async def archive_replaced_answer_memories(
                      AND id > $2 AND id <= $3""",
                 session_id, user_id, assistant_id,
             )
-            await conn.execute(
-                """UPDATE memories SET is_active = FALSE
-                   WHERE id IN (
-                       SELECT DISTINCT source.memory_id
-                       FROM memory_message_sources AS source
-                       JOIN conversations AS message ON message.id = source.message_id
-                       WHERE message.session_id = $1 AND message.role = 'assistant'
-                         AND message.id > $2 AND message.id <= $3
-                   )""",
-                session_id, user_id, assistant_id,
+            archived = await conn.execute(
+                ARCHIVE_ROUND_MEMORIES_SQL, session_id, user_id, assistant_id,
             )
+            count = int(archived.split()[-1]) if archived else 0
+            if count:
+                print(f"🔄 重生成：归档了上一版那一轮产生的 {count} 条记忆", flush=True)
             await conn.execute(
                 "DELETE FROM session_cache_state WHERE session_id = $1", session_id,
             )
@@ -1765,12 +1785,15 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                                    event_date: date = None,
                                    valid_until: date = None,
                                    supersede_target_id: int = None,
-                                   update_mode: str = None) -> dict:
+                                   update_mode: str = None,
+                                   round_assistant_id: int = None) -> dict:
     """自动提取 / MCP 写入共用的原子判重写入。
 
     kind / event_date / valid_until 只在新插入时写入。
     supersede_target_id：模型说这条是对某条旧记忆的更新（调用方已确认它在给模型看的那批里）；
     按 update_mode（默认取 MEMORY_UPDATE_MODE）处理旧条。
+    round_assistant_id：这次提取对应的那条回复。用户在提取跑完之前就点了重生成时，
+    那条回复已被作废（或删除），这一轮的结果整批不入库。
     """
     clean_content = str(content or "").strip()
     if not clean_content:
@@ -1801,6 +1824,17 @@ async def save_memory_deduplicated(content: str, importance: int = 5,
                 "SELECT pg_advisory_xact_lock($1)",
                 _MEMORY_DEDUP_LOCK_KEY,
             )
+            if round_assistant_id is not None:
+                round_alive = await conn.fetchval(
+                    """SELECT NOT is_superseded FROM conversations
+                       WHERE id = $1 AND session_id = $2""",
+                    int(round_assistant_id), source_session,
+                )
+                if not round_alive:
+                    return {
+                        "action": "skipped", "reason": "round_regenerated",
+                        "memory_id": None, "matched_id": None, "similarity": None,
+                    }
             if source_message_ids is not None:
                 valid_source_count = await conn.fetchval(
                     """SELECT COUNT(*) FROM conversations

@@ -47,6 +47,7 @@ from database import init_tables, close_pool, save_message, search_memories, sav
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 from database import get_active_memories_count, get_core_memories, get_memory_by_id, compute_valid_until, get_last_user_message_id
 from database import list_update_proposals, resolve_update_proposal, ProposalConflict
+from database import get_conversation_tail
 import memory_mcp
 import memory_fix
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
@@ -1326,6 +1327,33 @@ def find_deleted_assistant_rounds(db_messages: list, client_messages: list) -> l
     ]
 
 
+NONPARTITION_REROLL_DB_TAIL = 80
+NONPARTITION_REROLL_CLIENT_TAIL = 20
+
+
+async def _detect_nonpartition_reroll(session_id: str, client_messages: list):
+    """非分区模式：客户端历史里少了库里最后那条回复、末尾又是同一句话 → 是重新生成。
+
+    只处理最简单也最常见的情况（被重生成的就是库里最后一轮）。认出来就当场作废上一版
+    回复和那一轮产生的记忆，再让后台存档时替换掉那一轮。返回被替换的回复编号。
+    """
+    rows = await get_conversation_tail(session_id, NONPARTITION_REROLL_DB_TAIL)
+    if not rows:
+        return None
+    db_msgs = [db_row_to_message(row) for row in rows]
+    client_tail = [m for m in client_messages if m.get("role") != "system"][-NONPARTITION_REROLL_CLIENT_TAIL:]
+    index = find_partition_reroll_start(db_msgs, client_tail)
+    if index is None:
+        return None
+    if any(m.get("role") == "user" for m in db_msgs[index + 1:]):
+        return None
+    user_id = rows[index]["id"]
+    assistant_id = rows[-1]["id"]
+    await archive_replaced_answer_memories(session_id, user_id, assistant_id)
+    print("🔄 非分区模式: 客户端上下文表明正在重生成最后一条回复")
+    return assistant_id
+
+
 _extraction_locks = weakref.WeakValueDictionary()
 
 
@@ -2087,6 +2115,7 @@ async def _extract_and_store_memories(
             # valid_until 由代码定：state = 记录日 + TTL，plan = event_date + 3 天
             valid_until=compute_valid_until(kind, event_date, record_date),
             supersede_target_id=target_id,
+            round_assistant_id=stored_assistant_id,
         )
         action = result.get("action", "skipped")
         if result.get("supersedes"):
@@ -3105,6 +3134,24 @@ async def _chat_completions_inner(request: Request):
         body["messages"] = messages
     
     else:
+        # ---------- 非分区模式也识别「重新生成」：作废上一版回复和那一轮的记忆 ----------
+        if (
+            not skip_conversation_log
+            and not proactive_turn
+            and not tool_messages
+            and session_source != "generated"
+            and conversation_persistence_enabled()
+        ):
+            try:
+                reroll_expected_assistant_id = await _detect_nonpartition_reroll(
+                    session_id, original_messages,
+                )
+                partition_reroll = reroll_expected_assistant_id is not None
+            except Exception as e:
+                print(f"⚠️ 非分区重生成识别失败（按新的一轮处理）: {e}")
+                partition_reroll = False
+                reroll_expected_assistant_id = None
+
         # ---------- 原有逻辑：system prompt + 记忆注入 ----------
         # 召回搜索词：最近几轮真实对话（主动回合的隐藏提示会被跳过）
         recall_query = build_recall_query(original_messages, MEMORY_RECALL_QUERY_ROUNDS)
