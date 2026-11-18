@@ -48,6 +48,7 @@ from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_
 from database import get_active_memories_count, get_core_memories, get_memory_by_id, compute_valid_until, get_last_user_message_id
 from database import list_update_proposals, resolve_update_proposal, ProposalConflict
 import memory_mcp
+import memory_fix
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
 from memory_rebuilder import (
@@ -3906,6 +3907,78 @@ async def api_memory_rebuild_apply(plan_id: int, request: Request):
     try:
         return await apply_memory_rebuild_plan(plan_id, confirmed_plan_id)
     except RebuildApplyConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+# ============================================================
+# 修补旧记忆：相对时间改成具体日期 / 批量补 kind（预览 → 确认 → 应用，可撤回）
+# ============================================================
+
+def _check_apply_token(request: Request):
+    apply_token = os.getenv("MEMORY_REBUILD_APPLY_TOKEN", "")
+    if len(apply_token) < 32:
+        return JSONResponse(status_code=503, content={"error": "尚未配置安全 Apply 密钥"})
+    provided_token = request.headers.get("X-Memory-Rebuild-Apply-Key", "")
+    if not secrets.compare_digest(provided_token, apply_token):
+        return JSONResponse(status_code=403, content={"error": "Apply 密钥不正确"})
+    return None
+
+
+@app.post("/api/memories/fix/preview")
+async def api_memory_fix_preview(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    mode = (body or {}).get("mode", "time")
+    try:
+        return memory_fix.start_fix_preview(mode)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.get("/api/memories/fix/status")
+async def api_memory_fix_status():
+    return memory_fix.get_fix_status()
+
+
+@app.get("/api/memories/fix/plan/{plan_id}")
+async def api_memory_fix_plan(plan_id: int):
+    plan = await memory_fix.get_fix_plan(plan_id)
+    if not plan:
+        return JSONResponse(status_code=404, content={"error": "修补方案不存在"})
+    return plan
+
+
+@app.post("/api/memories/fix/plan/{plan_id}/apply")
+async def api_memory_fix_apply(plan_id: int, request: Request):
+    blocked = _check_apply_token(request)
+    if blocked:
+        return blocked
+    try:
+        body = await request.json()
+        confirmed_plan_id = int(body.get("confirmed_plan_id"))
+        excluded_ids = [int(value) for value in (body.get("excluded_ids") or [])]
+    except (ValueError, TypeError, AttributeError):
+        return JSONResponse(status_code=400, content={"error": "请确认方案编号"})
+    try:
+        return await memory_fix.apply_fix_plan(plan_id, confirmed_plan_id, excluded_ids)
+    except memory_fix.FixConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.post("/api/memories/fix/plan/{plan_id}/revert")
+async def api_memory_fix_revert(plan_id: int, request: Request):
+    blocked = _check_apply_token(request)
+    if blocked:
+        return blocked
+    try:
+        return await memory_fix.revert_fix_plan(plan_id)
+    except memory_fix.FixConflict as exc:
         return JSONResponse(status_code=409, content={"error": str(exc)})
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})

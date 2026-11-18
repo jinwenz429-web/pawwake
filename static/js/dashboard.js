@@ -2644,3 +2644,146 @@ async function resolveProposal(id, act) {
     }
     loadProposals();
 }
+
+
+// ============================================
+// 修补旧记忆（相对时间 / 补 kind）
+// ============================================
+let fixPollTimer = null;
+let fixActivePlan = null;
+const FIX_KIND_LABELS = {fact: '事实', state: '状态', event: '事件', plan: '计划', promise: '约定'};
+
+function openFixModal() {
+    document.getElementById('fixModal').style.display = 'flex';
+    refreshFixStatus();
+}
+
+function closeFixModal() {
+    document.getElementById('fixModal').style.display = 'none';
+}
+
+async function startFix(mode) {
+    document.getElementById('fixStatus').textContent = '正在扫描...';
+    document.getElementById('fixSummary').style.display = 'none';
+    document.getElementById('fixPreview').innerHTML = '';
+    document.getElementById('applyFixBtn').style.display = 'none';
+    document.getElementById('revertFixBtn').style.display = 'none';
+    fixActivePlan = null;
+    try {
+        await rebuildFetchJson('/api/memories/fix/preview', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({mode})
+        });
+        if (fixPollTimer) clearInterval(fixPollTimer);
+        fixPollTimer = setInterval(refreshFixStatus, 3000);
+        refreshFixStatus();
+    } catch (e) {
+        document.getElementById('fixStatus').textContent = '❌ ' + e.message;
+    }
+}
+
+async function refreshFixStatus() {
+    const statusEl = document.getElementById('fixStatus');
+    const buttons = [document.getElementById('startTimeFixBtn'), document.getElementById('startKindFixBtn')];
+    try {
+        const status = await rebuildFetchJson('/api/memories/fix/status');
+        if (status.running) {
+            buttons.forEach(b => b.disabled = true);
+            statusEl.textContent = '⏳ ' + (status.mode === 'kind' ? '补 kind' : '修补时间') + '：' +
+                (status.processed || 0) + '/' + (status.total || 0);
+            return;
+        }
+        buttons.forEach(b => b.disabled = false);
+        if (fixPollTimer) { clearInterval(fixPollTimer); fixPollTimer = null; }
+        if (status.error) { statusEl.textContent = '❌ 预览失败：' + status.error; return; }
+        if (status.phase === 'empty') { statusEl.textContent = '✅ 没有需要修补的记忆。'; return; }
+        if (status.plan_id) {
+            statusEl.textContent = '✅ 预览已生成，方案 #' + status.plan_id;
+            await loadFixPlan(status.plan_id);
+        }
+    } catch (e) {
+        statusEl.textContent = '❌ 状态查询失败：' + e.message;
+    }
+}
+
+function fixKindText(kind) {
+    return kind ? (FIX_KIND_LABELS[kind] || kind) : '无';
+}
+
+async function loadFixPlan(planId) {
+    const plan = await rebuildFetchJson('/api/memories/fix/plan/' + planId);
+    fixActivePlan = plan;
+    const summaryEl = document.getElementById('fixSummary');
+    summaryEl.style.display = 'block';
+    let summary = '<strong>方案 #' + plan.id + '（' + (plan.mode === 'kind' ? '补 kind' : '修补时间') + '）</strong>：' +
+        plan.items.length + ' 条有改动。状态：' + plan.status;
+    if (plan.apply_result) {
+        summary += '<br>已应用 ' + plan.apply_result.applied + ' 条，取消 ' + plan.apply_result.excluded +
+            ' 条，期间被改过而跳过 ' + plan.apply_result.skipped_changed + ' 条。';
+    }
+    summaryEl.innerHTML = summary;
+    const editable = plan.status === 'preview';
+    document.getElementById('fixPreview').innerHTML = plan.items.map(item => {
+        const contentChanged = item.old_content !== item.new_content;
+        const meta = '类型 ' + fixKindText(item.old_kind) + ' → ' + fixKindText(item.new_kind) +
+            ' · 事件日期 ' + (item.old_event_date || '无') + ' → ' + (item.new_event_date || '无') +
+            (item.recorded_at ? ' · 记于 ' + item.recorded_at : '');
+        return '<div class="card" style="padding:12px;margin:8px 0;">' +
+            '<label style="display:flex;gap:8px;align-items:flex-start;">' +
+            (editable ? '<input type="checkbox" class="fix-item" value="' + item.id + '" checked>' : '') +
+            '<div style="flex:1;"><div style="font-size:12px;color:var(--text-muted);">#' + item.id + ' · ' + escapeHtml(meta) + '</div>' +
+            (contentChanged
+                ? '<div style="margin-top:6px;text-decoration:line-through;opacity:.7;">' + escapeHtml(item.old_content) + '</div>' +
+                  '<div style="margin-top:4px;">' + escapeHtml(item.new_content) + '</div>'
+                : '<div style="margin-top:6px;">' + escapeHtml(item.old_content) + '</div>') +
+            '</div></label></div>';
+    }).join('') || '<div class="hint">没有需要改的条目。</div>';
+    document.getElementById('applyFixBtn').style.display = editable && plan.items.length ? '' : 'none';
+    document.getElementById('revertFixBtn').style.display = plan.status === 'applied' ? '' : 'none';
+}
+
+async function applyFix() {
+    const plan = fixActivePlan;
+    if (!plan || plan.status !== 'preview') return;
+    const checked = new Set([...document.querySelectorAll('.fix-item:checked')].map(el => Number(el.value)));
+    const excluded = plan.items.map(item => item.id).filter(id => !checked.has(id));
+    if (!confirm('应用方案 #' + plan.id + '：改 ' + checked.size + ' 条，跳过 ' + excluded.length + ' 条。旧内容会记进日志，可以撤回。确定？')) return;
+    const applyKey = prompt('请输入 Render Environment 中的 MEMORY_REBUILD_APPLY_TOKEN。密钥仅用于本次请求，不会保存在浏览器。');
+    if (!applyKey) return;
+    const statusEl = document.getElementById('fixStatus');
+    try {
+        const result = await rebuildFetchJson('/api/memories/fix/plan/' + plan.id + '/apply', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-Memory-Rebuild-Apply-Key': applyKey},
+            body: JSON.stringify({confirmed_plan_id: plan.id, excluded_ids: excluded})
+        });
+        statusEl.textContent = '✅ 已应用 ' + result.applied + ' 条' +
+            (result.skipped_changed ? '（' + result.skipped_changed + ' 条期间被改过，已跳过）' : '');
+        await loadFixPlan(plan.id);
+        if (typeof loadMemories === 'function') loadMemories();
+    } catch (e) {
+        statusEl.textContent = '❌ 应用失败：' + e.message;
+    }
+}
+
+async function revertFix() {
+    const plan = fixActivePlan;
+    if (!plan || plan.status !== 'applied') return;
+    if (!confirm('撤回方案 #' + plan.id + '？应用之后又被改过的条目不会动。')) return;
+    const applyKey = prompt('请输入 MEMORY_REBUILD_APPLY_TOKEN：');
+    if (!applyKey) return;
+    const statusEl = document.getElementById('fixStatus');
+    try {
+        const result = await rebuildFetchJson('/api/memories/fix/plan/' + plan.id + '/revert', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-Memory-Rebuild-Apply-Key': applyKey},
+            body: '{}'
+        });
+        statusEl.textContent = '↩️ 已撤回 ' + result.reverted + ' 条' +
+            (result.skipped_changed ? '（' + result.skipped_changed + ' 条之后又被改过，没动）' : '');
+        await loadFixPlan(plan.id);
+        if (typeof loadMemories === 'function') loadMemories();
+    } catch (e) {
+        statusEl.textContent = '❌ 撤回失败：' + e.message;
+    }
+}
