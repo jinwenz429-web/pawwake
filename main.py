@@ -382,6 +382,7 @@ async def lifespan(app: FastAPI):
                     "MEMORY_HW_KEYWORD": float, "MEMORY_HW_SEMANTIC": float,
                     "MEMORY_HW_IMPORTANCE": float, "MEMORY_HW_RECENCY": float,
                     "MEMORY_SEMANTIC_THRESHOLD": float,
+                    "MEMORY_STATE_TTL_DAYS": lambda v: max(1, int(v)),
                 }
                 # 显式空值也要恢复，否则重启时环境默认会覆盖面板上的清空操作。
                 _ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL"}
@@ -1376,17 +1377,30 @@ def _build_memory_extraction_messages(
         if msg.get("role") != "system"
     ]
     recent_rounds = group_by_rounds(non_system)[-max(1, interval):]
-    messages = [
-        {"role": msg.get("role"), "content": msg.get("content", ""),
-         "source_id": msg.get("source_id")}
-        for round_messages in recent_rounds
-        for msg in round_messages
-        if msg.get("role") in {"user", "assistant"}
-        and isinstance(msg.get("content"), str)
-        and msg.get("content").strip()
-    ]
+    messages = []
+    for round_messages in recent_rounds:
+        for msg in round_messages:
+            # tool 消息（包括 search_memory 查回来的旧记忆）一律不进提取窗口
+            if msg.get("role") not in {"user", "assistant"}:
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                content = _message_text(msg)
+            if not isinstance(content, str):
+                continue
+            # 网关注入的 <retrieved_memories> 等块不能再被当成新内容记一遍
+            content = _INJECTED_BLOCK_RE.sub("", content).strip()
+            if not content:
+                continue
+            messages.append({
+                "role": msg.get("role"),
+                "content": content,
+                "source_id": msg.get("source_id"),
+                # 本轮还没落库的消息没有 created_at，提取时按「现在」算
+                "created_at": msg.get("created_at"),
+            })
     messages.append({"role": "assistant", "content": assistant_msg,
-                     "source_id": current_assistant_id})
+                     "source_id": current_assistant_id, "created_at": None})
     return messages, len(recent_rounds)
 
 
@@ -1936,8 +1950,7 @@ async def _extract_and_store_memories(
 ):
     """提取 + 入库。调用方负责拿按 session 的锁。"""
     # 3. 获取已有记忆，传给提取模型做对比去重
-    existing = await get_recent_memories(limit=80)
-    existing_contents = [r["content"] for r in existing]
+    existing = [dict(row) for row in await get_recent_memories(limit=80)]
     
     # 4. 按逻辑轮截取近期上下文，而非发送完整会话。
     if context_messages:
@@ -1967,7 +1980,11 @@ async def _extract_and_store_memories(
     
     if guard_meta is not None:
         messages_for_extraction = persona_guard.filter_extraction_messages(messages_for_extraction)
-    new_memories = await extract_memories(messages_for_extraction, existing_memories=existing_contents)
+    extraction_now = datetime.now(timezone.utc)
+    new_memories = await extract_memories(
+        messages_for_extraction, existing_memories=existing, now=extraction_now,
+    )
+    record_date = (extraction_now + timedelta(hours=TIMEZONE_HOURS)).date()
     
     # 过滤垃圾记忆（不靠模型自觉，硬过滤）
     filtered_memories = []
@@ -1989,11 +2006,17 @@ async def _extract_and_store_memories(
 
     dedup_stats = {"inserted": 0, "updated": 0, "skipped": 0}
     for mem in filtered_memories:
+        kind = mem.get("kind")
+        event_date = mem.get("event_date")
         result = await save_memory_deduplicated(
             content=mem["content"],
             importance=mem["importance"],
             source_session=session_id,
             source_message_ids=mem["verified_source_ids"],
+            kind=kind,
+            event_date=event_date,
+            # valid_until 由代码定：state = 记录日 + TTL，plan = event_date + 3 天
+            valid_until=compute_valid_until(kind, event_date, record_date),
         )
         action = result.get("action", "skipped")
         dedup_stats[action] = dedup_stats.get(action, 0) + 1
@@ -5157,6 +5180,7 @@ async def get_settings():
             "MEMORY_HW_IMPORTANCE":     float(db.get("MEMORY_HW_IMPORTANCE") or _db_module.MEMORY_HW_IMPORTANCE),
             "MEMORY_HW_RECENCY":        float(db.get("MEMORY_HW_RECENCY") or _db_module.MEMORY_HW_RECENCY),
             "MEMORY_SEMANTIC_THRESHOLD": float(db.get("MEMORY_SEMANTIC_THRESHOLD") or _db_module.MEMORY_SEMANTIC_THRESHOLD),
+            "MEMORY_STATE_TTL_DAYS": int(db.get("MEMORY_STATE_TTL_DAYS") or _db_module.MEMORY_STATE_TTL_DAYS),
 
             # 其他
             "FORCE_STREAM":       _parse_bool(db.get("FORCE_STREAM"), FORCE_STREAM),
@@ -5222,6 +5246,7 @@ async def save_settings(request: Request):
             "MEMORY_HW_IMPORTANCE":    float,
             "MEMORY_HW_RECENCY":       float,
             "MEMORY_SEMANTIC_THRESHOLD": float,
+            "MEMORY_STATE_TTL_DAYS":   lambda v: max(1, int(v)),
         }
 
         # 只存 os.environ 的变量

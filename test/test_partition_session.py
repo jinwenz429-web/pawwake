@@ -692,7 +692,7 @@ class DeletedAssistantTests(unittest.TestCase):
         async def fake_save_message(session_id, role, content, model, metadata=None):
             return 101 if role == "user" else 102
 
-        async def fake_extract(messages, existing_memories=None):
+        async def fake_extract(messages, existing_memories=None, **kwargs):
             extracted_input.extend(messages)
             return [
                 {"content": "A real preference", "importance": 7, "source_ids": [101]},
@@ -712,6 +712,7 @@ class DeletedAssistantTests(unittest.TestCase):
             stack.enter_context(patch.object(main, "extract_memories", fake_extract))
             stack.enter_context(patch.object(main, "save_memory_deduplicated", fake_save_memory))
             stack.enter_context(patch.object(main, "get_all_memories_count", lambda: asyncio.sleep(0, result=1)))
+            stack.enter_context(patch.object(main, "get_active_memories_count", lambda: asyncio.sleep(0, result=1)))
             stack.enter_context(redirect_stdout(io.StringIO()))
             asyncio.run(main.process_memories_background(
                 "same-session", "I like word games", "Sounds good", "test-model",

@@ -560,6 +560,11 @@
                     </div>
                     <small class="form-hint" style="display:block;margin:-6px 0 10px;">开启后多出 remember / update_memory 两个工具，写入走和自动提取一样的去重，来源记为 mcp。默认关</small>
                     <div class="settings-field">
+                        <label>临时状态有效天数 (MEMORY_STATE_TTL_DAYS)</label>
+                        <input type="number" id="set-MEMORY_STATE_TTL_DAYS" class="input" min="1" max="365">
+                        <small class="form-hint">「在赶论文」这类状态记忆，记录日起多少天后注入时会标「可能已经变了」。计划类固定是计划日期后 3 天。默认 14</small>
+                    </div>
+                    <div class="settings-field">
                         <label>提取间隔轮数 (MEMORY_EXTRACT_INTERVAL)</label>
                         <input type="number" id="set-MEMORY_EXTRACT_INTERVAL" class="input" min="0" max="20">
                         <small class="form-hint">0=关闭提取，1=每轮，N=每N轮</small>

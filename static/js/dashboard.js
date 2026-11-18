@@ -222,7 +222,7 @@ function renderTable(mems, startIndex) {
             '<td class="col-title"><input type="text" class="title-input" id="t_' + m.id + '" value="' + escHtml(titleDisplay) + '" placeholder="无标题"></td>' +
             '<td class="col-content"><textarea class="content-textarea" id="c_' + m.id + '">' + escHtml(m.content) + '</textarea></td>' +
             '<td class="col-importance"><input type="number" class="importance-input" id="i_' + m.id + '" value="' + m.importance + '" min="1" max="10"></td>' +
-            '<td class="col-time">' + fmtTime(m.event_date || m.created_at) + '</td>' +
+            '<td class="col-time">' + fmtTime(m.event_date || m.created_at) + memMetaBadges(m) + '</td>' +
             '<td class="col-actions"><div class="row-actions">' +
                 '<button class="btn btn-primary btn-sm" onclick="saveMem(' + m.id + ')">保存</button>' +
                 revertBtn +
@@ -231,6 +231,17 @@ function renderTable(mems, startIndex) {
             '</div></td>' +
             '</tr>';
     }).join('');
+}
+
+const MEMORY_KIND_LABELS = {fact: '事实', state: '状态', event: '事件', plan: '计划', promise: '约定'};
+
+function memMetaBadges(m) {
+    const parts = [];
+    if (m.kind && MEMORY_KIND_LABELS[m.kind]) parts.push(MEMORY_KIND_LABELS[m.kind]);
+    if (m.valid_until) parts.push('有效至 ' + String(m.valid_until).slice(0, 10));
+    if (m.superseded_by) parts.push('已被 #' + m.superseded_by + ' 取代');
+    if (!parts.length) return '';
+    return '<div class="form-hint" style="margin-top:4px;">' + escHtml(parts.join(' · ')) + '</div>';
 }
 
 function escHtml(s) {
@@ -2265,7 +2276,7 @@ const _SETTINGS_FIELDS = {
     str: ['API_BASE_URL', 'API_KEY', 'DEFAULT_MODEL', 'MEMORY_API_KEY', 'MEMORY_MODEL',
           'CACHE_SUMMARY_MODEL', 'CACHE_TTL', 'CACHE_PARTITION_TRIGGER', 'EMBEDDING_API_KEY', 'EMBEDDING_BASE_URL', 'EMBEDDING_MODEL', 'REASONING_EFFORT'],
     int: ['MAX_MEMORIES_INJECT', 'MAX_CONVERSATIONS_INJECT', 'MEMORY_EXTRACT_INTERVAL', 'CACHE_PARTITION_X', 'CACHE_PARTITION_WINDOW', 'EMBEDDING_DIM',
-          'MEMORY_RECALL_QUERY_ROUNDS', 'MEMORY_CORE_ALWAYS_INJECT'],
+          'MEMORY_RECALL_QUERY_ROUNDS', 'MEMORY_CORE_ALWAYS_INJECT', 'MEMORY_STATE_TTL_DAYS'],
     float: ['MIN_SCORE_THRESHOLD', 'CONVERSATION_MIN_SCORE_THRESHOLD',
             'CONVERSATION_SEEN_TTL_HOURS'],
     bool: ['MEMORY_ENABLED', 'CONVERSATION_RECALL_ENABLED', 'CACHE_PARTITION_ENABLED', 'MEMORY_VECTOR_ENABLED', 'FORCE_STREAM',
