@@ -46,6 +46,7 @@ from database import (
 from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, replace_last_conversation_round, archive_replaced_answer_memories, delete_assistant_rounds, delete_auxiliary_suggestion_messages, delete_redundant_reroll_tail, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
 from database import get_active_memories_count, get_core_memories, get_memory_by_id, compute_valid_until, get_last_user_message_id
+from database import get_conversation_tail
 import memory_mcp
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
@@ -1317,6 +1318,33 @@ def find_deleted_assistant_rounds(db_messages: list, client_messages: list) -> l
     ]
 
 
+NONPARTITION_REROLL_DB_TAIL = 80
+NONPARTITION_REROLL_CLIENT_TAIL = 20
+
+
+async def _detect_nonpartition_reroll(session_id: str, client_messages: list):
+    """非分区模式：客户端历史里少了库里最后那条回复、末尾又是同一句话 → 是重新生成。
+
+    只处理最简单也最常见的情况（被重生成的就是库里最后一轮）。认出来就当场作废上一版
+    回复和那一轮产生的记忆，再让后台存档时替换掉那一轮。返回被替换的回复编号。
+    """
+    rows = await get_conversation_tail(session_id, NONPARTITION_REROLL_DB_TAIL)
+    if not rows:
+        return None
+    db_msgs = [db_row_to_message(row) for row in rows]
+    client_tail = [m for m in client_messages if m.get("role") != "system"][-NONPARTITION_REROLL_CLIENT_TAIL:]
+    index = find_partition_reroll_start(db_msgs, client_tail)
+    if index is None:
+        return None
+    if any(m.get("role") == "user" for m in db_msgs[index + 1:]):
+        return None
+    user_id = rows[index]["id"]
+    assistant_id = rows[-1]["id"]
+    await archive_replaced_answer_memories(session_id, user_id, assistant_id)
+    print("🔄 非分区模式: 客户端上下文表明正在重生成最后一条回复")
+    return assistant_id
+
+
 _extraction_locks = weakref.WeakValueDictionary()
 
 
@@ -2016,6 +2044,7 @@ async def _extract_and_store_memories(
             importance=mem["importance"],
             source_session=session_id,
             source_message_ids=mem["verified_source_ids"],
+            round_assistant_id=stored_assistant_id,
         )
         action = result.get("action", "skipped")
         dedup_stats[action] = dedup_stats.get(action, 0) + 1
@@ -3028,6 +3057,24 @@ async def _chat_completions_inner(request: Request):
         body["messages"] = messages
     
     else:
+        # ---------- 非分区模式也识别「重新生成」：作废上一版回复和那一轮的记忆 ----------
+        if (
+            not skip_conversation_log
+            and not proactive_turn
+            and not tool_messages
+            and session_source != "generated"
+            and conversation_persistence_enabled()
+        ):
+            try:
+                reroll_expected_assistant_id = await _detect_nonpartition_reroll(
+                    session_id, original_messages,
+                )
+                partition_reroll = reroll_expected_assistant_id is not None
+            except Exception as e:
+                print(f"⚠️ 非分区重生成识别失败（按新的一轮处理）: {e}")
+                partition_reroll = False
+                reroll_expected_assistant_id = None
+
         # ---------- 原有逻辑：system prompt + 记忆注入 ----------
         # 召回搜索词：最近几轮真实对话（主动回合的隐藏提示会被跳过）
         recall_query = build_recall_query(original_messages, MEMORY_RECALL_QUERY_ROUNDS)
