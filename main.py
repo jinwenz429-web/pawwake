@@ -48,6 +48,7 @@ from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_
 from database import get_active_memories_count, get_core_memories, get_memory_by_id, compute_valid_until, get_last_user_message_id
 from database import list_update_proposals, resolve_update_proposal, ProposalConflict
 import memory_mcp
+import memory_fix
 import database as _db_module  # 用于 /api/settings 热更新 database.py 全局变量
 from memory_extractor import extract_memories, score_memories
 from memory_rebuilder import (
@@ -3938,6 +3939,78 @@ async def api_memory_rebuild_apply(plan_id: int, request: Request):
 
 
 # ============================================================
+# 修补旧记忆：相对时间改成具体日期 / 批量补 kind（预览 → 确认 → 应用，可撤回）
+# ============================================================
+
+def _check_apply_token(request: Request):
+    apply_token = os.getenv("MEMORY_REBUILD_APPLY_TOKEN", "")
+    if len(apply_token) < 32:
+        return JSONResponse(status_code=503, content={"error": "尚未配置安全 Apply 密钥"})
+    provided_token = request.headers.get("X-Memory-Rebuild-Apply-Key", "")
+    if not secrets.compare_digest(provided_token, apply_token):
+        return JSONResponse(status_code=403, content={"error": "Apply 密钥不正确"})
+    return None
+
+
+@app.post("/api/memories/fix/preview")
+async def api_memory_fix_preview(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    mode = (body or {}).get("mode", "time")
+    try:
+        return memory_fix.start_fix_preview(mode)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.get("/api/memories/fix/status")
+async def api_memory_fix_status():
+    return memory_fix.get_fix_status()
+
+
+@app.get("/api/memories/fix/plan/{plan_id}")
+async def api_memory_fix_plan(plan_id: int):
+    plan = await memory_fix.get_fix_plan(plan_id)
+    if not plan:
+        return JSONResponse(status_code=404, content={"error": "修补方案不存在"})
+    return plan
+
+
+@app.post("/api/memories/fix/plan/{plan_id}/apply")
+async def api_memory_fix_apply(plan_id: int, request: Request):
+    blocked = _check_apply_token(request)
+    if blocked:
+        return blocked
+    try:
+        body = await request.json()
+        confirmed_plan_id = int(body.get("confirmed_plan_id"))
+        excluded_ids = [int(value) for value in (body.get("excluded_ids") or [])]
+    except (ValueError, TypeError, AttributeError):
+        return JSONResponse(status_code=400, content={"error": "请确认方案编号"})
+    try:
+        return await memory_fix.apply_fix_plan(plan_id, confirmed_plan_id, excluded_ids)
+    except memory_fix.FixConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.post("/api/memories/fix/plan/{plan_id}/revert")
+async def api_memory_fix_revert(plan_id: int, request: Request):
+    blocked = _check_apply_token(request)
+    if blocked:
+        return blocked
+    try:
+        return await memory_fix.revert_fix_plan(plan_id)
+    except memory_fix.FixConflict as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+# ============================================================
 # 三层记忆架构：整理 / 合并 / 升级 / 统计
 # ============================================================
 
@@ -3945,13 +4018,15 @@ CONSOLIDATION_PROMPT = """
 你是记忆整理助手。请将以下对话碎片整理成完整的事件记录。
 
 要求：
-1. 按主题/事件分组，相关的碎片合并到一起
+1. 按主题/事件分组，只把确认是同一件事的碎片合并到一起；不同的事分开写
 2. 每个事件一条记录，不要太细碎也不要太笼统
 3. 每条记录包含：标题（10字内）+ 完整描述
-4. 合并重复内容，保留重要细节
-5. 保留原文中的主观感受、情绪表达和个人化用语，不要改写为客观陈述或第三方总结
-6. content字段中不要使用双引号，用单引号或书名号代替
-7. 每个输入碎片ID必须且只能出现在一个事件的merged_ids中，不得遗漏或重复；无法与其他内容合并的碎片也要单独生成一条事件
+4. 合并重复内容，保留所有具体细节：人名、地点、原因、数字
+5. 保留原话（标明是谁说的），保留原文中的主观感受、情绪表达和个人化用语，不要改写为客观陈述或第三方总结
+6. 保留具体日期：碎片里写了哪天就写哪天，不要改成「那天」「最近」；不要过度压缩成一句概括
+7. 不得编造碎片里没有的信息
+8. content字段中不要使用双引号，用单引号或书名号代替
+9. 每个输入碎片ID必须且只能出现在一个事件的merged_ids中，不得遗漏或重复；无法与其他内容合并的碎片也要单独生成一条事件
 
 碎片记忆：
 {fragments}
@@ -4101,9 +4176,10 @@ async def _post_consolidation_completion(client, prompt, model, max_tokens, labe
 
 
 async def _request_consolidation_events(client, fragments, model, max_tokens):
+    from memory_extractor import format_local_stamp
     fragments_text = "\n".join([
         f"[ID={fragment['id']}] "
-        f"({fragment['created_at'].strftime('%m-%d') if hasattr(fragment['created_at'], 'strftime') else str(fragment['created_at'])[:10]}) "
+        f"({format_local_stamp(fragment['created_at']) if fragment.get('created_at') else '日期不明'}) "
         f"{fragment['content']}"
         for fragment in fragments
     ])

@@ -107,6 +107,7 @@
                         <div class="toolbar-actions">
                             <button class="btn btn-warning" id="consolidateBtn" onclick="openConsolidateModal()">整理记忆</button>
                             <button class="btn btn-primary" id="rebuildBtn" onclick="openRebuildModal()">整理新碎片</button>
+                            <button class="btn btn-secondary" id="fixBtn" onclick="openFixModal()">修补时间</button>
                             <label class="checkbox-label">
                                 <input type="checkbox" id="selectAll" onchange="toggleAll()">
                                 <span>全选</span>
@@ -223,7 +224,7 @@
             <div id="rebuildModal" class="modal" style="display:none;">
                 <div class="modal-content modal-wide">
                     <h3>整理新碎片</h3>
-                    <p>只整理活跃且尚未整理过的碎片记忆，生成 KEEP / MERGE / EVENT / DISCARD 方案。已整理的记忆、事件记忆和核心记忆会跳过。</p>
+                    <p>只整理活跃且尚未整理过的碎片记忆，生成 KEEP / MERGE / EVENT / DISCARD / UPDATE 方案。只合并确认是同一件事的碎片，保留原话、细节和日期。相关的已有核心/事件记忆会作为参考给模型看，必要时可以 UPDATE 它们。</p>
                     <p class="hint">先生成并审阅方案；点击应用后会再次核对全部来源，整批写入可回滚。原记忆仅软归档，不永久删除。</p>
                     <div id="rebuildStatus" style="margin: 14px 0; color: var(--text-light);">尚未运行</div>
                     <div id="rebuildSummary" class="card" style="display:none; padding:14px; margin:12px 0;"></div>
@@ -232,6 +233,25 @@
                         <button class="btn btn-secondary" onclick="closeRebuildModal()">关闭</button>
                         <button class="btn btn-primary" id="startRebuildBtn" onclick="startMemoryRebuild()">生成碎片整理方案</button>
                         <button class="btn btn-danger" id="applyRebuildBtn" style="display:none;" onclick="applyMemoryRebuild()">应用已审阅方案</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 修补旧记忆弹窗 -->
+            <div id="fixModal" class="modal" style="display:none;">
+                <div class="modal-content modal-wide">
+                    <h3>修补旧记忆</h3>
+                    <p><b>修补时间</b>：找出内容里还写着「昨天」「下周」「最近」这类相对时间的活跃记忆，按每条的记录时间改写成具体日期，顺带补上类型和事件日期。<b>批量补 kind</b>：给没有类型的老记忆补上类型，不改内容。</p>
+                    <p class="hint">先生成预览，逐条看原文和改写后的对比，不想改的取消勾选。应用时原地更新，旧内容记进日志，可以整份撤回；内容改了的会重算向量。</p>
+                    <div id="fixStatus" style="margin: 14px 0; color: var(--text-light);">尚未运行</div>
+                    <div id="fixSummary" class="card" style="display:none; padding:14px; margin:12px 0;"></div>
+                    <div id="fixPreview" style="max-height:420px; overflow:auto;"></div>
+                    <div class="modal-actions">
+                        <button class="btn btn-secondary" onclick="closeFixModal()">关闭</button>
+                        <button class="btn btn-primary" id="startTimeFixBtn" onclick="startFix('time')">扫描相对时间</button>
+                        <button class="btn btn-secondary" id="startKindFixBtn" onclick="startFix('kind')">批量补 kind</button>
+                        <button class="btn btn-danger" id="applyFixBtn" style="display:none;" onclick="applyFix()">应用勾选的改动</button>
+                        <button class="btn btn-warning" id="revertFixBtn" style="display:none;" onclick="revertFix()">撤回这份修补</button>
                     </div>
                 </div>
             </div>
