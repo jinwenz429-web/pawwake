@@ -572,6 +572,11 @@
                         </div>
                     </div>
                     <div class="settings-field">
+                        <label>记忆模型 API 地址 (MEMORY_API_BASE_URL)</label>
+                        <input type="text" id="set-MEMORY_API_BASE_URL" class="input" placeholder="留空 = 和主 API 地址一样">
+                        <small class="form-hint">记忆提取、评分、整理新碎片、按日整理、修补时间都走这个地址。填完整的 chat/completions 地址，格式和上面的主 API 地址一样。和下面的 Key 配对使用</small>
+                    </div>
+                    <div class="settings-field">
                         <label>记忆模型 API Key (MEMORY_API_KEY)</label>
                         <input type="text" id="set-MEMORY_API_KEY" class="input" placeholder="sk-...">
                         <small class="form-hint" id="set-MEMORY_API_KEY-hint">不设则使用主 API Key，适用于中转站不同模型需要不同 Key 的场景</small>

@@ -29,8 +29,17 @@ MEMORY_MODEL = os.getenv("MEMORY_MODEL") or DEFAULT_MEMORY_MODEL
 # 也算进这条额度，JSON 可能在收尾前被截断，表面只报"未找到JSON数组"
 MEMORY_MAX_TOKENS = int(os.getenv("MEMORY_MAX_TOKENS", "4000"))
 
+# 记忆模型专用接口地址（不设则回退到主 API_BASE_URL）。和 MEMORY_API_KEY 配对：
+# 主聊天走一家、记忆提取/整理走另一家时，两边的地址和 Key 各填各的
+MEMORY_API_BASE_URL = os.getenv("MEMORY_API_BASE_URL", "")
+
+
 def get_memory_api_key() -> str:
     return MEMORY_API_KEY or API_KEY
+
+
+def get_memory_api_base_url() -> str:
+    return (MEMORY_API_BASE_URL or "").strip() or API_BASE_URL
 
 
 def _diagnose_incomplete(finish_reason, completion_tokens, reasoning_tokens) -> str:
@@ -231,7 +240,7 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: li
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
-                API_BASE_URL,
+                get_memory_api_base_url(),
                 headers={
                     "Authorization": f"Bearer {get_memory_api_key()}",
                     "Content-Type": "application/json",
@@ -388,7 +397,7 @@ async def score_memories(texts: List[str]) -> List[Dict]:
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
-                API_BASE_URL,
+                get_memory_api_base_url(),
                 headers={
                     "Authorization": f"Bearer {get_memory_api_key()}",
                     "Content-Type": "application/json",
