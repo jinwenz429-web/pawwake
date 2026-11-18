@@ -238,3 +238,56 @@ class CrossBatchKeepTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NonPartitionRerollTests(unittest.IsolatedAsyncioTestCase):
+    ROWS = [
+        {"id": 1, "role": "user", "content": "晚安", "metadata": None},
+        {"id": 2, "role": "assistant", "content": "晚安～", "metadata": None},
+        {"id": 3, "role": "user", "content": "明天想吃火锅", "metadata": None},
+        {"id": 4, "role": "assistant", "content": "上一版回复", "metadata": None},
+    ]
+
+    async def run_request(self, messages):
+        archive = AsyncMock()
+        background = AsyncMock()
+        stack = ExitStack()
+        for name, value in {
+            "CACHE_PARTITION_ENABLED": False, "MEMORY_ENABLED": False,
+            "MEMORY_EXTRACT_ENABLED": False, "FORCE_STREAM": False, "REASONING_EFFORT": "",
+        }.items():
+            stack.enter_context(patch.object(main, name, value))
+        stack.enter_context(patch.object(main, "get_system_prompt", AsyncMock(return_value="")))
+        stack.enter_context(patch.object(main, "conversation_persistence_enabled", return_value=True))
+        stack.enter_context(patch.object(main, "get_conversation_tail", AsyncMock(return_value=self.ROWS)))
+        stack.enter_context(patch.object(main, "archive_replaced_answer_memories", archive))
+        stack.enter_context(patch.object(main, "process_memories_background", background))
+        stack.enter_context(patch.object(persona_guard, "guard_applies_to_model", return_value=False))
+        stack.enter_context(patch.object(main, "recent_quarantine_fingerprints", AsyncMock(return_value=set())))
+        stack.enter_context(patch.object(main.httpx, "AsyncClient", lambda **kwargs: REAL_ASYNC_CLIENT(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json=completion("新回复"))),
+            **kwargs)))
+        stack.enter_context(redirect_stdout(io.StringIO()))
+        with stack:
+            await main._chat_completions_inner(FakeRequest(messages))
+            await asyncio.sleep(0)
+        return archive, background
+
+    async def test_regenerate_is_recognized_and_old_round_memories_archived(self):
+        archive, background = await self.run_request([
+            {"role": "user", "content": "晚安"}, {"role": "assistant", "content": "晚安～"},
+            {"role": "user", "content": "明天想吃火锅"},
+        ])
+        archive.assert_awaited_once_with("conv-1", 3, 4)
+        kwargs = background.call_args.kwargs
+        self.assertTrue(kwargs["reroll"])
+        self.assertEqual(kwargs["reroll_expected_assistant_id"], 4)
+
+    async def test_saying_the_same_thing_again_is_a_new_turn(self):
+        archive, background = await self.run_request([
+            {"role": "user", "content": "晚安"}, {"role": "assistant", "content": "晚安～"},
+            {"role": "user", "content": "明天想吃火锅"}, {"role": "assistant", "content": "上一版回复"},
+            {"role": "user", "content": "明天想吃火锅"},
+        ])
+        archive.assert_not_awaited()
+        self.assertFalse(background.call_args.kwargs["reroll"])
