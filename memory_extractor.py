@@ -112,7 +112,10 @@ EXTRACTION_PROMPT = """你是长期记忆筛选器。你的任务不是记录聊
 
 # 输出格式
 每条记忆必须给出支撑它的最少消息编号 source_ids。只引用真正提供该事实的消息；
-如果没有带编号的消息能支撑，就不要输出那条记忆。只返回 JSON 数组：
+如果没有带编号的消息能支撑，就不要输出那条记忆。
+source_ids 里至少要有一条是用户消息：AI 回复里转述或猜测的用户信息不能单独作为来源。
+唯一例外是 AI 对用户做出的承诺、约定，这类记忆加上 "kind": "promise"，允许只引用 AI 的消息。
+只返回 JSON 数组：
 [
   {{"content": "高度凝练、可独立理解的长期记忆", "importance": 分数, "source_ids": [消息编号]}},
   {{"content": "完整的重要事件或长期事实", "importance": 分数, "source_ids": [消息编号]}}
@@ -263,10 +266,15 @@ async def extract_memories(messages: List[Dict[str, str]], existing_memories: Li
             for mem in memories:
                 if isinstance(mem, dict) and "content" in mem:
                     source_ids = mem.get("source_ids")
+                    try:
+                        importance = int(mem.get("importance", 5))
+                    except (TypeError, ValueError):
+                        importance = 5
                     valid_memories.append({
                         "content": str(mem["content"]),
-                        "importance": int(mem.get("importance", 5)),
+                        "importance": max(1, min(10, importance)),
                         "source_ids": source_ids if isinstance(source_ids, list) else [],
+                        "kind": str(mem.get("kind") or "").strip().lower() or None,
                     })
 
             print(f"📝 从对话中提取了 {len(valid_memories)} 条新记忆（已对比 {len(existing_memories or [])} 条已有记忆）")

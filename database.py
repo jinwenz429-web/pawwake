@@ -2163,7 +2163,10 @@ async def get_pending_memory_embedding_count():
 
 
 async def backfill_memory_embeddings(batch_size: int = 20):
-    """给已有记忆补算embedding（没有embedding的记忆）"""
+    """给已有记忆补算embedding（没有embedding的记忆）
+
+    覆盖所有没有向量的记忆（活跃的排在前面，归档的也会补，恢复后直接可用）。
+    """
     if not EMBEDDING_API_KEY:
         print("⚠️ EMBEDDING_API_KEY 未设置，无法补算embedding")
         return 0
@@ -2176,14 +2179,14 @@ async def backfill_memory_embeddings(batch_size: int = 20):
             rows = await conn.fetch("""
                 SELECT id, content FROM memories 
                 WHERE embedding IS NULL AND content IS NOT NULL
-                ORDER BY id
+                ORDER BY (is_active IS TRUE) DESC, id
                 LIMIT $1
             """, batch_size)
         else:
             rows = await conn.fetch("""
                 SELECT id, content FROM memories 
                 WHERE embedding_json IS NULL AND content IS NOT NULL
-                ORDER BY id
+                ORDER BY (is_active IS TRUE) DESC, id
                 LIMIT $1
             """, batch_size)
     
@@ -2449,6 +2452,12 @@ async def get_all_memories_count():
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT COUNT(*) as cnt FROM memories")
         return row["cnt"]
+
+
+async def get_active_memories_count():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM memories WHERE is_active = TRUE")
 
 
 async def get_all_memories():
