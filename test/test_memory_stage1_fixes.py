@@ -212,7 +212,7 @@ class CrossBatchKeepTests(unittest.IsolatedAsyncioTestCase):
         ]
         calls = []
 
-        async def fake_once(items, label):
+        async def fake_once(items, label, existing=None):
             calls.append([item["id"] for item in items])
             if label.startswith("跨批次"):
                 return [{"action": "KEEP", "source_ids": [items[0]["id"]], "target_layer": 3,

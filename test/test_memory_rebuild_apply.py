@@ -145,6 +145,12 @@ class FakeConnection:
             row = self.sources[args[0]]
             row.update(title=args[1], importance=args[2], layer=args[3])
             return "UPDATE 1"
+        if "UPDATE memories SET is_active = FALSE, superseded_by" in sql:
+            target = self.sources.get(args[1])
+            if not target or not target["is_active"]:
+                return "UPDATE 0"
+            target.update(is_active=False, superseded_by=args[0])
+            return "UPDATE 1"
         if "UPDATE memories SET is_active = FALSE" in sql:
             changed = 0
             for source_id in args[0]:
@@ -160,6 +166,10 @@ class FakeConnection:
         raise AssertionError(sql)
 
     async def fetchval(self, sql, *args):
+        if "memory_update_proposals" in sql:
+            self.proposals = getattr(self, "proposals", [])
+            self.proposals.append(args)
+            return len(self.proposals)
         if self.fail_insert:
             raise RuntimeError("simulated insert failure")
         assert "INSERT INTO memories" in sql
@@ -168,6 +178,8 @@ class FakeConnection:
             "id": self.next_id, "content": args[0], "importance": args[1],
             "layer": args[2], "title": args[3], "is_active": True,
             "merged_from": args[4], "event_date": args[5], "created_at": None,
+            "kind": args[6] if len(args) > 6 else None,
+            "valid_until": args[7] if len(args) > 7 else None,
         }
         return self.next_id
 

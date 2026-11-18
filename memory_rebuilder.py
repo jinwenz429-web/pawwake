@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 import json
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
+from datetime import date, datetime
 
 import httpx
 
@@ -15,13 +16,15 @@ from database import get_pool
 REBUILD_BATCH_SIZE = int(os.getenv("MEMORY_REBUILD_BATCH_SIZE", "25"))
 REBUILD_GROUP_SIZE = int(os.getenv("MEMORY_REBUILD_GROUP_SIZE", "45"))
 REBUILD_MAX_TOKENS = int(os.getenv("MEMORY_REBUILD_MAX_TOKENS", "8000"))
+REBUILD_EXISTING_CONTEXT = int(os.getenv("MEMORY_REBUILD_EXISTING_CONTEXT", "10"))
 REBUILD_SCOPE = "unprocessed_fragments"
 
 # Applied plans also cover unchanged KEEP sources and created memories whose
 # merged_from links may later be cleared by archive cleanup. Previews do not.
 _ACTIVE_MEMORIES_SQL = """
     SELECT m.id, m.content, m.importance, m.layer, m.title,
-           m.created_at, m.event_date, m.merged_from,
+           m.created_at, m.event_date, m.merged_from, m.kind, m.valid_until,
+           m.superseded_by,
            EXISTS (
                SELECT 1 FROM memory_rebuild_plans p
                WHERE p.status = 'applied' AND (
@@ -179,39 +182,51 @@ async def _load_active_memories():
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             "event_date": str(row["event_date"]) if row["event_date"] else None,
             "merged_from": list(row["merged_from"] or []),
+            "kind": row.get("kind"),
+            "valid_until": str(row["valid_until"]) if row.get("valid_until") else None,
         })
     return result
 
 
-CLASSIFY_PROMPT = """你正在审查一个长期记忆库。不是聊天摘要库。
-请逐条判断输入记忆是否值得继续占据长期记忆。
+def _local_created(value) -> str | None:
+    """created_at（ISO 字符串或 datetime）转成本地日期时间文字，给模型看。"""
+    if not value:
+        return None
+    try:
+        return _me.format_local_stamp(value)
+    except Exception:
+        return str(value)[:16]
 
-长期价值标准：
-- 三个月后仍能帮助理解用户、维持关系连续性或继续长期任务；
-- 稳定身份/偏好/关系/目标/持续状态/价值观；
-- 真正改变项目后续状态的里程碑或稳定结论；
-- 有显著情绪、关系或人生叙事意义的重要事件。
 
-应丢弃：
-- 普通吃饭、出行、天气、临时日程、一次性琐事；
-- 技术调试流水、已经被最终结论取代的中间步骤；
-- 没有未来用途的随口细节；
-- 明显只是另一条长期事实的低信息量改写。
+CLASSIFY_PROMPT = """你在帮一个陪伴型 AI 整理它关于对方的记忆。目标是让它像一个认识对方很久的人，
+不是做知识库，所以生活里的事、情绪、关系、约定都值得留。请逐条判断输入的记忆碎片。
 
-decision 只能是 core / event / discard。
-core = 适合作为稳定语义记忆；event = 值得保留的情景记忆；discard = 应归档。
+值得留的（和平时提取记忆的标准一致）：
+- 稳定事实、偏好、关系、目标和计划、正在发生的状态、健康
+- 生活里值得回忆的细节（去了哪、吃了什么特别的、遇到的事），即使是日常
+- 情绪上重要的时刻、双方的约定和承诺
+
+应丢弃的（discard）：
+- 寒暄、纯知识问答或翻译、调试过程（只留最终结论那条）
+- 关于记忆系统本身的讨论、AI 的思考过程
+- 和另一条完全重复、没有多出任何信息的
+
+decision 只能是 core / event / discard：
+core = 稳定的事实/偏好/关系/目标；event = 发生过的事、某一天的经历；discard = 应归档。
 domain 必须从以下值中选：
 identity, preferences, relationships, goals, ongoing_state, projects_tech,
 health, fandom_travel, values_emotions, significant_events, other
 
-topic 要短且稳定，用于把同一概念聚到一起，例如“考研目标”“母女关系”“Pawwake部署”。
-normalized_content 对 core/event 写成高度凝练、可独立理解的版本；discard 可为空。
-reason 用一句话解释判断，不要写泛泛的“重要/不重要”。
+topic 要短且稳定，用于把同一概念聚到一起，例如「考研目标」「母女关系」「Pawwake部署」。
+normalized_content 一般留空；只有原文看不懂（缺主语、指代不清）时才写一个补全后的版本，
+补全时保留原文的细节、原话和日期，不许压缩。
+reason 用一句话解释判断，不要写泛泛的「重要/不重要」。
+每条输入带 created_at（记录时间）、event_date、kind，判断时参考，不要改动日期。
 
 必须为每个输入 id 输出且只输出一次，不能新增不存在的 id。
 只输出 JSON 数组：
 [{"id":1,"decision":"core","domain":"goals","topic":"考研目标",
-"normalized_content":"...","importance":8,"reason":"..."}]
+"normalized_content":"","importance":8,"reason":"..."}]
 
 输入：
 {items}
@@ -256,7 +271,9 @@ async def _classify_batch(items):
         "title": item["title"],
         "content": item["content"],
         "importance": item["importance"],
+        "created_at": _local_created(item.get("created_at")),
         "event_date": item["event_date"],
+        "kind": item.get("kind"),
     } for item in items]
     result = await _post_json_array(
         CLASSIFY_PROMPT.replace("{items}", _json_text(payload)),
@@ -265,43 +282,54 @@ async def _classify_batch(items):
     return _validate_classification(items, result)
 
 
-SYNTHESIZE_PROMPT = """你正在把同一领域的长期记忆候选整理成最终记忆方案。
-输入中的每个 id 必须且只能被一个输出动作覆盖。
+SYNTHESIZE_PROMPT = """你在把同一领域的记忆碎片整理成最终方案。只合并，不压缩。
+输入分两部分：
+- fragments：待整理的碎片。每个 id 必须且只能被一个输出动作的 source_ids 覆盖；
+- existing：库里已有的相关核心记忆/事件记忆（「已有记忆，id=…」），只供参考，
+  除非用 UPDATE，否则不要把它们放进 source_ids。
 
 动作：
-- KEEP：单条已经足够完整，source_ids 必须只有一个；
-- MERGE：多条描述同一稳定事实/目标/偏好/项目状态，合成一条 layer=3；
-- EVENT：一条或多条属于同一个有长期叙事价值的重要事件，合成 layer=2；
-- DISCARD：结合上下文后确认没有长期价值，允许一条或多条。
+- KEEP：原样保留那一条碎片，source_ids 只有一个。不许改写 content（输出的 content 会被忽略），
+  只能调整 title、importance、target_layer；
+- MERGE：多条碎片确认是同一个稳定事实/目标/偏好/状态，合成一条 layer=3；
+- EVENT：一条或多条碎片确认是同一件事（同一天、同一个经历），合成 layer=2；
+- DISCARD：结合上下文后确认没有保留价值；
+- UPDATE：碎片说明某条已有记忆的情况变了或需要补充。target_id 填那条已有记忆的 id，
+  source_ids 填提供新信息的碎片，content 写成完整的现状（例如「以前喜欢喝咖啡，2026-11 起改喝茶」）。
+  每条已有记忆最多被 UPDATE 一次。
 
 关键规则：
-0. KEEP 表示原样保留那一条：不许改写 content（输出的 content 会被忽略，原文原样留在库里），
-   只能调整 title、importance、target_layer。
-1. 同一广泛主题下的不同事实不要硬合并；只有真正属于同一概念/同一事件才合并。
-2. 稳定事实默认 layer=3；情景事件 layer=2。
-3. 输出 content 必须自包含、凝练，但不要把有情绪意义的事件压成空洞标签。
-4. 不要保留调试流水和普通日常；保留最终根因、决定、稳定结果。
-5. reason 要具体说明为什么保留/合并/事件化/归档。
-6. 不得编造输入中没有的信息。
+1. 只合并确认是同一个概念或同一件事的条目；同一大主题下的不同事实不要硬合并。
+2. 不同日期发生的不同事件不能合并成一条。
+3. 合并后要保留原话（谁说的）、具体细节（人名、地点、原因、数字）和具体日期；
+   不要写成概括性的标签，宁可长一点。
+4. 不得编造输入中没有的信息，日期以输入为准。
+5. 稳定事实默认 layer=3；具体经历 layer=2。
+6. reason 要具体说明为什么保留/合并/事件化/归档/更新。
 
 只输出 JSON 数组：
 [{"action":"MERGE","source_ids":[1,2],"target_layer":3,"title":"考研目标",
-"content":"...","importance":8,"reason":"两条描述同一长期目标，合并后信息更完整"}]
+"content":"...","importance":8,"reason":"两条描述同一长期目标，合并后信息更完整"},
+{"action":"UPDATE","target_id":88,"source_ids":[3],"target_layer":3,"title":"饮品偏好",
+"content":"以前喜欢喝咖啡，2026-11 起改喝茶","importance":6,"reason":"碎片 3 说明口味变了"}]
 
 输入：
 {items}
 """
 
 
-def _validate_actions(source_ids, actions):
+def _validate_actions(source_ids, actions, existing_ids=None):
+    """校验整理动作：每个碎片恰好被覆盖一次；UPDATE 只能指向给模型看过的已有记忆，各一次。"""
     expected = {int(value) for value in source_ids}
+    allowed_targets = {int(value) for value in (existing_ids or [])}
     seen = set()
+    seen_targets = set()
     normalized = []
     for raw in actions:
         if not isinstance(raw, dict):
             raise ValueError("整理结果包含非对象")
         action = str(raw.get("action", "")).strip().upper()
-        if action not in {"KEEP", "MERGE", "EVENT", "DISCARD"}:
+        if action not in {"KEEP", "MERGE", "EVENT", "DISCARD", "UPDATE"}:
             raise ValueError(f"非法 action: {action}")
         ids = [int(value) for value in (raw.get("source_ids") or [])]
         if not ids:
@@ -310,8 +338,19 @@ def _validate_actions(source_ids, actions):
             raise ValueError("KEEP 只能覆盖一条来源")
         if action == "MERGE" and len(ids) < 2:
             raise ValueError("MERGE 至少需要两条来源")
-        if action in {"MERGE", "EVENT"} and not str(raw.get("content", "")).strip():
+        if action in {"MERGE", "EVENT", "UPDATE"} and not str(raw.get("content", "")).strip():
             raise ValueError(f"{action} 缺少 content")
+        target_id = None
+        if action == "UPDATE":
+            try:
+                target_id = int(raw.get("target_id"))
+            except (TypeError, ValueError):
+                raise ValueError("UPDATE 缺少 target_id")
+            if target_id not in allowed_targets:
+                raise ValueError(f"UPDATE 指向了没给出的已有记忆 #{target_id}")
+            if target_id in seen_targets:
+                raise ValueError(f"已有记忆 #{target_id} 被 UPDATE 了不止一次")
+            seen_targets.add(target_id)
         for memory_id in ids:
             if memory_id not in expected or memory_id in seen:
                 raise ValueError("整理结果 source_ids 覆盖异常")
@@ -325,7 +364,7 @@ def _validate_actions(source_ids, actions):
             target_layer = 3
         elif target_layer not in {1, 2, 3}:
             target_layer = 3
-        normalized.append({
+        item = {
             "action": action,
             "source_ids": ids,
             "target_layer": target_layer,
@@ -333,40 +372,104 @@ def _validate_actions(source_ids, actions):
             "content": str(raw.get("content", "")).strip(),
             "importance": max(1, min(10, int(raw.get("importance", 5)))),
             "reason": str(raw.get("reason", "")).strip()[:500],
-        })
+        }
+        if action == "UPDATE":
+            item["target_id"] = target_id
+            for key in ("target_content", "target_hash", "target_layer_before", "target_kind"):
+                if key in raw:
+                    item[key] = raw[key]
+        normalized.append(item)
     if seen != expected:
         raise ValueError(f"整理遗漏 {sorted(expected - seen)}")
     return normalized
 
 
-async def _synthesize_once(candidates, label):
-    payload = [{
+def _candidate_payload(item):
+    source = item["source"]
+    payload = {
         "id": item["id"],
-        "current_layer": item["source"]["layer"],
+        "current_layer": source["layer"],
         "topic": item["topic"],
         "suggested_kind": item["decision"],
-        "normalized_content": item["normalized_content"],
-        "original_content": item["source"]["content"],
+        "original_content": source["content"],
+        "created_at": _local_created(source.get("created_at")),
+        "event_date": source.get("event_date"),
+        "kind": source.get("kind"),
         "importance": item["importance"],
-    } for item in candidates]
+    }
+    if item.get("normalized_content"):
+        payload["normalized_content"] = item["normalized_content"]
+    if item.get("_original_contents"):
+        # 跨批次归并：带上原始碎片原文，不能只给上一轮压过的版本
+        payload["original_fragments"] = item["_original_contents"]
+    return payload
+
+
+def _existing_payload(existing):
+    return [{
+        "existing_id": mem["id"],
+        "note": f"已有记忆，id={mem['id']}",
+        "layer": mem.get("layer"),
+        "kind": mem.get("kind"),
+        "event_date": str(mem["event_date"]) if mem.get("event_date") else None,
+        "created_at": _local_created(mem.get("created_at")),
+        "content": mem.get("content") or "",
+    } for mem in (existing or [])]
+
+
+async def _synthesize_once(candidates, label, existing=None):
+    payload = {
+        "fragments": [_candidate_payload(item) for item in candidates],
+        "existing": _existing_payload(existing),
+    }
     source_ids = [item["id"] for item in candidates]
     result = await _post_json_array(
         SYNTHESIZE_PROMPT.replace("{items}", _json_text(payload)),
         label,
     )
-    actions = _validate_actions(source_ids, result)
-    # KEEP 不许改写：预览里显示的就是库里那条原文，免得看着像改过
+    existing_map = {int(mem["id"]): mem for mem in (existing or [])}
+    actions = _validate_actions(source_ids, result, existing_map.keys())
     by_id = {item["id"]: item for item in candidates}
     for action in actions:
         if action["action"] == "KEEP":
+            # KEEP 不许改写：预览里显示的就是库里那条原文，免得看着像改过
             action["content"] = by_id[action["source_ids"][0]]["source"]["content"]
+        elif action["action"] == "UPDATE":
+            target = existing_map[action["target_id"]]
+            action["target_content"] = target.get("content") or ""
+            action["target_hash"] = _content_hash(target.get("content") or "")
+            action["target_layer_before"] = int(target.get("layer") or 1)
+            action["target_kind"] = target.get("kind")
     return actions
 
 
-async def _synthesize_domain(candidates, domain):
-    if len(candidates) <= REBUILD_GROUP_SIZE:
-        return await _synthesize_once(candidates, f"领域整理:{domain}")
+async def _related_existing(candidates, exclude_ids):
+    """和这批碎片相关的已有核心/事件记忆（混合检索），给合成那一步参考。"""
+    if REBUILD_EXISTING_CONTEXT <= 0:
+        return []
+    text = "\n".join(item["source"]["content"] for item in candidates)[:4000]
+    try:
+        rows = await _db.search_memories(text, limit=REBUILD_EXISTING_CONTEXT * 3)
+    except Exception as exc:
+        print(f"⚠️ 碎片整理：检索已有记忆失败，本领域不带参考: {exc}", flush=True)
+        return []
+    exclude = {int(value) for value in exclude_ids}
+    related = []
+    for row in rows:
+        mem = dict(row)
+        if int(mem["id"]) in exclude or int(mem.get("layer") or 1) not in (2, 3):
+            continue
+        related.append(mem)
+        if len(related) >= REBUILD_EXISTING_CONTEXT:
+            break
+    return related
 
+
+async def _synthesize_domain(candidates, domain, existing=None):
+    if len(candidates) <= REBUILD_GROUP_SIZE:
+        return await _synthesize_once(candidates, f"领域整理:{domain}", existing)
+
+    # 分批时，第一轮不给已有记忆（避免几批各自 UPDATE 同一条），跨批次归并那一轮再给
     provisional = []
     for index in range(0, len(candidates), REBUILD_GROUP_SIZE):
         chunk = candidates[index:index + REBUILD_GROUP_SIZE]
@@ -376,6 +479,7 @@ async def _synthesize_domain(candidates, domain):
 
     # 再把跨批次形成的保留候选做一次归并；已判定 DISCARD 的候选直接保留，
     # 避免空 content 被下一轮误当成 core。
+    by_id = {item["id"]: item for item in candidates}
     final = [action for action in provisional if action["action"] == "DISCARD"]
     pseudo = []
     for index, action in enumerate(
@@ -387,18 +491,29 @@ async def _synthesize_domain(candidates, domain):
             "id": synthetic_id,
             "decision": "event" if action["target_layer"] == 2 else "core",
             "topic": action["title"] or domain,
-            "normalized_content": action["content"],
+            "normalized_content": "",
             "importance": action["importance"],
             "source": {
                 "layer": action["target_layer"] or 1,
                 "content": action["content"],
+                "created_at": min(
+                    (by_id[i]["source"].get("created_at") or "" for i in action["source_ids"]),
+                    default=None,
+                ) or None,
+                "event_date": min(
+                    (by_id[i]["source"].get("event_date") for i in action["source_ids"]
+                     if by_id[i]["source"].get("event_date")),
+                    default=None,
+                ),
+                "kind": by_id[action["source_ids"][0]]["source"].get("kind"),
             },
+            "_original_contents": [by_id[i]["source"]["content"] for i in action["source_ids"]],
             "_original_source_ids": action["source_ids"],
             "_provisional_action": action,
         })
 
     if pseudo:
-        reconciled = await _synthesize_once(pseudo, f"跨批次归并:{domain}")
+        reconciled = await _synthesize_once(pseudo, f"跨批次归并:{domain}", existing)
         for action in reconciled:
             if action["action"] == "KEEP":
                 # 跨批次 KEEP = 保留上一轮那个动作本身（可能是 MERGE/EVENT），只采纳新的标题和分数
@@ -416,7 +531,7 @@ async def _synthesize_domain(candidates, domain):
             final.append(action)
 
     all_ids = [item["id"] for item in candidates]
-    return _validate_actions(all_ids, final)
+    return _validate_actions(all_ids, final, [mem["id"] for mem in (existing or [])])
 
 
 async def _save_plan(source_memories, actions):
@@ -429,6 +544,7 @@ async def _save_plan(source_memories, actions):
         ),
         "merge_actions": sum(1 for action in actions if action["action"] == "MERGE"),
         "event_actions": sum(1 for action in actions if action["action"] == "EVENT"),
+        "update_actions": sum(1 for action in actions if action["action"] == "UPDATE"),
         "core_actions": sum(
             1 for action in actions
             if action["action"] in {"KEEP", "MERGE"} and action["target_layer"] == 3
@@ -519,14 +635,18 @@ async def run_memory_rebuild_preview():
             candidates = domains.get(domain, [])
             if not candidates:
                 continue
-            actions.extend(await _synthesize_domain(candidates, domain))
+            existing = await _related_existing(candidates, source_map.keys())
+            actions.extend(await _synthesize_domain(candidates, domain, existing))
             print(
                 f"🧩 碎片重整领域完成: {domain} ({len(candidates)} 条候选)",
                 flush=True,
             )
 
         all_ids = [item["id"] for item in source_memories]
-        actions = _validate_actions(all_ids, actions)
+        actions = _validate_actions(
+            all_ids, actions,
+            [action["target_id"] for action in actions if action["action"] == "UPDATE"],
+        )
         plan_id, summary = await _save_plan(source_memories, actions)
         _status.update({
             "running": False,
@@ -632,7 +752,44 @@ async def get_memory_rebuild_plan(plan_id: int):
     }
 
 
-def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int) -> dict:
+def _as_date(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _inherited_fields(sources, preferred_kind=None):
+    """新建记忆继承来源的 kind / event_date / valid_until。
+
+    kind：优先用被更新那条的；否则取来源里最多的那种。
+    event_date：来源里最早的事件日（没有就用记录日），和以前一致。
+    valid_until：取最晚的那个；有任何一条为空就为空（说明里面有长期有效的内容）。
+    """
+    kinds = [str(src.get("kind")) for src in sources if src.get("kind")]
+    kind = preferred_kind or (Counter(kinds).most_common(1)[0][0] if kinds else None)
+    dates = []
+    for src in sources:
+        value = _as_date(src.get("event_date")) or _as_date(src.get("created_at"))
+        if value is not None:
+            dates.append(value)
+    valid = [_as_date(src.get("valid_until")) for src in sources]
+    valid_until = max(valid) if valid and all(v is not None for v in valid) else None
+    return {
+        "kind": kind,
+        "event_date": min(dates) if dates else None,
+        "valid_until": valid_until,
+    }
+
+
+def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int,
+                           update_mode: str = "observe") -> dict:
     """Validate only the saved fragment sources against the locked snapshot."""
     if not _is_fragment_plan(plan):
         raise RebuildApplyConflict("旧整库方案已停用，请重新生成仅整理新碎片的方案")
@@ -655,11 +812,16 @@ def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int) 
                 f"来源记忆 #{source_id} 已变化，请重新生成并审阅方案"
             )
 
-    actions = _validate_actions(expected_ids, plan.get("actions") or [])
+    raw_actions = plan.get("actions") or []
+    target_ids = [raw.get("target_id") for raw in raw_actions
+                  if str(raw.get("action", "")).upper() == "UPDATE"]
+    actions = _validate_actions(expected_ids, raw_actions, [int(t) for t in target_ids if t is not None])
+    active_map = {int(item["id"]): item for item in active_sources}
     archive_ids = []
     kept_ids = []
     keep_updates = []
     creates = []
+    proposals = []
     for action in actions:
         ids = action["source_ids"]
         if action["action"] == "DISCARD":
@@ -680,26 +842,50 @@ def _prepare_rebuild_apply(plan: dict, active_sources: list, source_count: int) 
                     "layer": action["target_layer"],
                 })
             continue
+        sources = [source_map[source_id] for source_id in ids]
+        if action["action"] == "UPDATE":
+            target = active_map.get(action["target_id"])
+            if (target is None or target.get("superseded_by")
+                    or _content_hash(target["content"]) != action.get("target_hash")):
+                raise RebuildApplyConflict(
+                    f"要更新的已有记忆 #{action['target_id']} 已变化或已归档，请重新生成并审阅方案"
+                )
+            inherited = _inherited_fields(sources + [target], target.get("kind"))
+            item = {
+                "content": action["content"],
+                "importance": action["importance"],
+                "layer": action["target_layer"],
+                "title": action["title"] or (target.get("title") or ""),
+                "merged_from": ids,
+                **inherited,
+            }
+            if update_mode == "apply":
+                archive_ids.extend(ids)
+                creates.append({**item, "supersede": int(target["id"])})
+            else:
+                # observe：新旧都不动、碎片也先留着，只记一条提议；采纳时才新建、归档
+                proposals.append({
+                    "old_id": int(target["id"]),
+                    "old_content": target["content"],
+                    "payload": {**item, "event_date": str(item["event_date"]) if item["event_date"] else None,
+                                "valid_until": str(item["valid_until"]) if item["valid_until"] else None},
+                })
+            continue
         archive_ids.extend(ids)
-        dates = []
-        for source_id in ids:
-            source = source_map[source_id]
-            date_value = source["event_date"] or source["created_at"]
-            if date_value is not None:
-                dates.append(date_value.date() if hasattr(date_value, "date") else date_value)
         creates.append({
             "content": action["content"],
             "importance": action["importance"],
             "layer": action["target_layer"],
             "title": action["title"],
             "merged_from": ids,
-            "event_date": min(dates) if dates else None,
+            **_inherited_fields(sources),
         })
     return {
         "archive_ids": sorted(archive_ids),
         "kept_ids": sorted(kept_ids),
         "keep_updates": keep_updates,
         "creates": creates,
+        "proposals": proposals,
     }
 
 
@@ -724,8 +910,10 @@ async def apply_memory_rebuild_plan(plan_id: int, confirmed_plan_id: int) -> dic
             # Exclude concurrent INSERT/UPDATE while comparing the saved snapshot.
             await conn.execute("LOCK TABLE memories IN SHARE ROW EXCLUSIVE MODE")
             active_rows = await conn.fetch(_ACTIVE_MEMORIES_SQL)
+            update_mode = _db.current_update_mode()
             prepared = _prepare_rebuild_apply(
-                _jsonb_object(row["plan"]), active_rows, int(row["source_count"])
+                _jsonb_object(row["plan"]), active_rows, int(row["source_count"]),
+                update_mode,
             )
             archive_ids = prepared["archive_ids"]
             if archive_ids:
@@ -746,20 +934,42 @@ async def apply_memory_rebuild_plan(plan_id: int, confirmed_plan_id: int) -> dic
 
             created_ids = []
             created_contents = []
+            superseded = 0
             for item in prepared["creates"]:
                 new_id = await conn.fetchval(
                     """INSERT INTO memories
                        (content, importance, layer, title, is_active,
-                        merged_from, event_date)
-                       VALUES ($1, $2, $3, $4, TRUE, $5, $6)
+                        merged_from, event_date, kind, valid_until)
+                       VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $8)
                        RETURNING id""",
                     item["content"], item["importance"], item["layer"],
                     item["title"], item["merged_from"], item["event_date"],
+                    item.get("kind"), item.get("valid_until"),
                 )
                 if new_id is None:
                     raise RuntimeError("创建整理记忆失败，整批操作已回滚")
                 created_ids.append(int(new_id))
                 created_contents.append(item["content"])
+                if item.get("supersede"):
+                    command = await conn.execute(
+                        """UPDATE memories SET is_active = FALSE, superseded_by = $1
+                           WHERE id = $2 AND is_active = TRUE""",
+                        int(new_id), item["supersede"],
+                    )
+                    if int(command.split()[-1]) != 1:
+                        raise RebuildApplyConflict("要更新的已有记忆已变化，整批操作已回滚")
+                    superseded += 1
+
+            proposal_ids = []
+            for item in prepared["proposals"]:
+                proposal_id = await conn.fetchval(
+                    """INSERT INTO memory_update_proposals
+                       (new_memory_id, old_memory_id, new_content, old_content, source, payload)
+                       VALUES (NULL, $1, $2, $3, 'rebuild', $4::jsonb) RETURNING id""",
+                    item["old_id"], item["payload"]["content"], item["old_content"],
+                    _json_text(item["payload"]),
+                )
+                proposal_ids.append(int(proposal_id))
 
             result = {
                 "status": "applied",
@@ -769,6 +979,10 @@ async def apply_memory_rebuild_plan(plan_id: int, confirmed_plan_id: int) -> dic
                 "kept_updated": len(prepared["keep_updates"]),
                 "created": len(created_ids),
                 "created_ids": created_ids,
+                "update_mode": update_mode,
+                "superseded": superseded,
+                "proposals": len(proposal_ids),
+                "proposal_ids": proposal_ids,
             }
             await conn.execute(
                 """UPDATE memory_rebuild_plans

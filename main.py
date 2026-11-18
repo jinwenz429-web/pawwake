@@ -3919,13 +3919,15 @@ CONSOLIDATION_PROMPT = """
 你是记忆整理助手。请将以下对话碎片整理成完整的事件记录。
 
 要求：
-1. 按主题/事件分组，相关的碎片合并到一起
+1. 按主题/事件分组，只把确认是同一件事的碎片合并到一起；不同的事分开写
 2. 每个事件一条记录，不要太细碎也不要太笼统
 3. 每条记录包含：标题（10字内）+ 完整描述
-4. 合并重复内容，保留重要细节
-5. 保留原文中的主观感受、情绪表达和个人化用语，不要改写为客观陈述或第三方总结
-6. content字段中不要使用双引号，用单引号或书名号代替
-7. 每个输入碎片ID必须且只能出现在一个事件的merged_ids中，不得遗漏或重复；无法与其他内容合并的碎片也要单独生成一条事件
+4. 合并重复内容，保留所有具体细节：人名、地点、原因、数字
+5. 保留原话（标明是谁说的），保留原文中的主观感受、情绪表达和个人化用语，不要改写为客观陈述或第三方总结
+6. 保留具体日期：碎片里写了哪天就写哪天，不要改成「那天」「最近」；不要过度压缩成一句概括
+7. 不得编造碎片里没有的信息
+8. content字段中不要使用双引号，用单引号或书名号代替
+9. 每个输入碎片ID必须且只能出现在一个事件的merged_ids中，不得遗漏或重复；无法与其他内容合并的碎片也要单独生成一条事件
 
 碎片记忆：
 {fragments}
@@ -4075,9 +4077,10 @@ async def _post_consolidation_completion(client, prompt, model, max_tokens, labe
 
 
 async def _request_consolidation_events(client, fragments, model, max_tokens):
+    from memory_extractor import format_local_stamp
     fragments_text = "\n".join([
         f"[ID={fragment['id']}] "
-        f"({fragment['created_at'].strftime('%m-%d') if hasattr(fragment['created_at'], 'strftime') else str(fragment['created_at'])[:10]}) "
+        f"({format_local_stamp(fragment['created_at']) if fragment.get('created_at') else '日期不明'}) "
         f"{fragment['content']}"
         for fragment in fragments
     ])

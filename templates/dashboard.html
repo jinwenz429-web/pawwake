@@ -223,7 +223,7 @@
             <div id="rebuildModal" class="modal" style="display:none;">
                 <div class="modal-content modal-wide">
                     <h3>整理新碎片</h3>
-                    <p>只整理活跃且尚未整理过的碎片记忆，生成 KEEP / MERGE / EVENT / DISCARD 方案。已整理的记忆、事件记忆和核心记忆会跳过。</p>
+                    <p>只整理活跃且尚未整理过的碎片记忆，生成 KEEP / MERGE / EVENT / DISCARD / UPDATE 方案。只合并确认是同一件事的碎片，保留原话、细节和日期。相关的已有核心/事件记忆会作为参考给模型看，必要时可以 UPDATE 它们。</p>
                     <p class="hint">先生成并审阅方案；点击应用后会再次核对全部来源，整批写入可回滚。原记忆仅软归档，不永久删除。</p>
                     <div id="rebuildStatus" style="margin: 14px 0; color: var(--text-light);">尚未运行</div>
                     <div id="rebuildSummary" class="card" style="display:none; padding:14px; margin:12px 0;"></div>

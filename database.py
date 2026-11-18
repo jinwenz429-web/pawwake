@@ -317,6 +317,9 @@ async def init_tables():
                 resolved_at     TIMESTAMPTZ DEFAULT NULL
             )
         """)
+        # 整理新碎片在 observe 模式下的 UPDATE：新记忆先不建，内容放在 payload 里，采纳时才建
+        await conn.execute("ALTER TABLE memory_update_proposals ALTER COLUMN new_memory_id DROP NOT NULL")
+        await conn.execute("ALTER TABLE memory_update_proposals ADD COLUMN IF NOT EXISTS payload JSONB")
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_memory_update_proposals_status
             ON memory_update_proposals (status, id)
@@ -1954,13 +1957,31 @@ class ProposalConflict(Exception):
     pass
 
 
+def _proposal_payload(value) -> dict:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
 async def resolve_update_proposal(proposal_id: int, accept: bool) -> dict:
-    """采纳 = 归档旧条并记下 superseded_by；忽略 = 只改提议状态。"""
+    """采纳 = 归档旧条并记下 superseded_by；忽略 = 只改提议状态。
+
+    整理新碎片产生的提议（new_memory_id 为空）在采纳时才新建那条记忆，
+    并把它合并来源里还活跃的碎片一起归档。
+    """
     pool = await get_pool()
+    created_id = None
+    created_content = None
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                """SELECT id, new_memory_id, old_memory_id, status
+                """SELECT id, new_memory_id, old_memory_id, status, payload
                    FROM memory_update_proposals WHERE id = $1 FOR UPDATE""",
                 int(proposal_id),
             )
@@ -1969,16 +1990,53 @@ async def resolve_update_proposal(proposal_id: int, accept: bool) -> dict:
             if row["status"] != "pending":
                 raise ProposalConflict("这条提议已经处理过了")
             archived = 0
+            new_id = row["new_memory_id"]
             if accept:
-                new_active = await conn.fetchval(
-                    "SELECT is_active FROM memories WHERE id = $1", row["new_memory_id"],
+                old_active = await conn.fetchval(
+                    "SELECT is_active FROM memories WHERE id = $1", row["old_memory_id"],
                 )
-                if not new_active:
-                    raise ProposalConflict("新记忆已经不在活跃记忆里，不能用它取代旧记忆")
+                if new_id is None:
+                    if not old_active:
+                        raise ProposalConflict("旧记忆已经不在活跃记忆里了，这条提议可以忽略")
+                    payload = _proposal_payload(row["payload"])
+                    if not str(payload.get("content") or "").strip():
+                        raise ProposalConflict("提议里没有新内容")
+                    merged_from = [int(v) for v in (payload.get("merged_from") or [])]
+                    new_id = await conn.fetchval(
+                        """INSERT INTO memories
+                           (content, importance, layer, title, is_active, merged_from,
+                            event_date, kind, valid_until, source_session)
+                           VALUES ($1, $2, $3, $4, TRUE, $5, $6, $7, $8, 'rebuild')
+                           RETURNING id""",
+                        payload["content"], int(payload.get("importance") or 5),
+                        int(payload.get("layer") or 3), payload.get("title") or "",
+                        merged_from or None,
+                        _parse_backup_date(payload.get("event_date")),
+                        _normalize_kind(payload.get("kind")),
+                        _parse_backup_date(payload.get("valid_until")),
+                    )
+                    created_id = int(new_id)
+                    created_content = payload["content"]
+                    if merged_from:
+                        await conn.execute(
+                            """UPDATE memories SET is_active = FALSE
+                               WHERE id = ANY($1::int[]) AND is_active = TRUE AND id <> $2""",
+                            merged_from, row["old_memory_id"],
+                        )
+                    await conn.execute(
+                        "UPDATE memory_update_proposals SET new_memory_id = $2 WHERE id = $1",
+                        int(proposal_id), created_id,
+                    )
+                else:
+                    new_active = await conn.fetchval(
+                        "SELECT is_active FROM memories WHERE id = $1", new_id,
+                    )
+                    if not new_active:
+                        raise ProposalConflict("新记忆已经不在活跃记忆里，不能用它取代旧记忆")
                 command = await conn.execute(
                     """UPDATE memories SET is_active = FALSE, superseded_by = $1
                        WHERE id = $2 AND is_active = TRUE""",
-                    row["new_memory_id"], row["old_memory_id"],
+                    new_id, row["old_memory_id"],
                 )
                 archived = int(command.split()[-1]) if command else 0
             await conn.execute(
@@ -1986,7 +2044,16 @@ async def resolve_update_proposal(proposal_id: int, accept: bool) -> dict:
                    SET status = $2, resolved_at = NOW() WHERE id = $1""",
                 int(proposal_id), "accepted" if accept else "ignored",
             )
-    return {"status": "accepted" if accept else "ignored", "archived": archived}
+    if created_id and MEMORY_VECTOR_ENABLED:
+        try:
+            embedding = await compute_embedding(created_content)
+            if embedding:
+                async with pool.acquire() as conn:
+                    await save_memory_embedding(conn, created_id, embedding)
+        except Exception as exc:
+            print(f"⚠️ 采纳提议新建的记忆 #{created_id} embedding 计算失败: {exc}")
+    return {"status": "accepted" if accept else "ignored", "archived": archived,
+            "created_id": created_id}
 
 
 async def dedupe_active_fragment_memories(
@@ -3609,6 +3676,16 @@ async def deactivate_memories(memory_ids: list):
         """, memory_ids)
 
 
+def inherit_kind_and_valid_until(sources) -> tuple:
+    """新建记忆继承来源：kind 取最多的那种；valid_until 取最晚的，有任何一条为空就为空。"""
+    from collections import Counter
+    kinds = [str(src["kind"]) for src in sources if src["kind"]]
+    kind = Counter(kinds).most_common(1)[0][0] if kinds else None
+    valid = [src["valid_until"] for src in sources]
+    valid_until = max(valid) if valid and all(v is not None for v in valid) else None
+    return kind, valid_until
+
+
 async def create_consolidated_events(events: list, expected_fragment_ids: list):
     """原子地创建整理事件并归档被完整覆盖的来源碎片。
 
@@ -3651,7 +3728,7 @@ async def create_consolidated_events(events: list, expected_fragment_ids: list):
     async with pool.acquire() as conn:
         async with conn.transaction():
             rows = await conn.fetch("""
-                SELECT id
+                SELECT id, kind, valid_until
                 FROM memories
                 WHERE id = ANY($1::int[])
                   AND layer = 1
@@ -3659,17 +3736,21 @@ async def create_consolidated_events(events: list, expected_fragment_ids: list):
                 FOR UPDATE
             """, expected_ids)
             active_ids = {int(row["id"]) for row in rows}
+            source_meta = {int(row["id"]): row for row in rows}
             if active_ids != expected_set:
                 unavailable = sorted(expected_set - active_ids)
                 raise RuntimeError(f"部分来源碎片已被其他操作修改: {unavailable}")
 
             for event in events:
+                kind, valid_until = inherit_kind_and_valid_until(
+                    [source_meta[memory_id] for memory_id in event["merged_ids"]]
+                )
                 row = await conn.fetchrow("""
                     INSERT INTO memories (
                         content, importance, layer, title,
-                        is_active, merged_from, event_date
+                        is_active, merged_from, event_date, kind, valid_until
                     )
-                    VALUES ($1, $2, 2, $3, TRUE, $4, $5)
+                    VALUES ($1, $2, 2, $3, TRUE, $4, $5, $6, $7)
                     RETURNING id
                 """,
                     event.get("content", ""),
@@ -3677,6 +3758,8 @@ async def create_consolidated_events(events: list, expected_fragment_ids: list):
                     event.get("title", ""),
                     event["merged_ids"],
                     event.get("event_date"),
+                    kind or "event",
+                    valid_until,
                 )
                 if not row:
                     raise RuntimeError("创建事件记忆失败")

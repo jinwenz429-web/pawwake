@@ -970,11 +970,18 @@ async function loadMemoryRebuildPlan(planId) {
         (summary.estimated_active_after || 0) + ' 条；建议丢弃 ' +
         (summary.discarded_sources || 0) + ' 条；合并动作 ' +
         (summary.merge_actions || 0) + '；事件动作 ' +
-        (summary.event_actions || 0) + '。' +
+        (summary.event_actions || 0) + '；更新已有记忆 ' +
+        (summary.update_actions || 0) + '。' +
+        ((summary.update_actions || 0) > 0
+            ? '<br>更新已有记忆的动作按「更新旧记忆的方式」处理：observe 只生成提议（去「记忆更新提议」页采纳），apply 直接归档旧记忆。'
+            : '') +
         (data.status === 'applied' && data.apply_result
             ? '<br><strong>已应用：</strong>实际归档 ' + data.apply_result.archived +
               ' 条，新增 ' + data.apply_result.created + ' 条，原样保留 ' +
-              data.apply_result.kept + ' 条。'
+              data.apply_result.kept + ' 条' +
+              (data.apply_result.proposals ? '，生成更新提议 ' + data.apply_result.proposals + ' 条' : '') +
+              (data.apply_result.superseded ? '，取代已有记忆 ' + data.apply_result.superseded + ' 条' : '') +
+              '。'
             : '');
 
     const sourceMap = new Map((allMemories || []).map(m => [m.id, m]));
@@ -986,6 +993,10 @@ async function loadMemoryRebuildPlan(planId) {
             return '<div style="margin:4px 0;color:var(--text-light);">#' + id + ' · ' +
                 escapeHtml(String(text).slice(0, 180)) + '</div>';
         }).join('');
+        const target = action.action === 'UPDATE'
+            ? '<div style="margin:6px 0;color:var(--text-light);">已有记忆 #' + action.target_id + '（将被取代）· ' +
+              '<span style="text-decoration:line-through;">' + escapeHtml(String(action.target_content || '').slice(0, 300)) + '</span></div>'
+            : '';
         const proposed = action.content
             ? '<div style="margin-top:8px;"><strong>→ ' + escapeHtml(action.title || '') +
               '</strong><div>' + escapeHtml(action.content) + '</div></div>'
@@ -993,7 +1004,7 @@ async function loadMemoryRebuildPlan(planId) {
         return '<div class="card" style="padding:12px;margin:8px 0;">' +
             '<div><strong>' + (index + 1) + '. ' + escapeHtml(action.action) +
             '</strong> · layer ' + escapeHtml(String(action.target_layer || '-')) + '</div>' +
-            sources + proposed +
+            target + sources + proposed +
             '<div style="margin-top:8px;color:var(--text-muted);font-size:13px;">理由：' +
             escapeHtml(action.reason || '未提供') + '</div></div>';
     }).join('');
@@ -2602,17 +2613,18 @@ async function loadProposals() {
             card.style.cssText = 'padding: 12px 0; border-bottom: 1px solid var(--border-color, #eee);';
             const oldState = item.old_active === false ? '（旧记忆已归档）' : '';
             const newState = item.new_active === false ? '（新记忆已归档）' : '';
+            const newLabel = item.new_memory_id ? '#' + item.new_memory_id : '新记忆（采纳时创建）';
             const actions = item.status === 'pending'
                 ? `<button class="btn btn-primary btn-sm" data-act="accept">采纳</button>
                    <button class="btn btn-sm" data-act="ignore">忽略</button>`
                 : `<span style="font-size:12px;color:var(--text-muted);">${escHtml(_PROPOSAL_STATUS[item.status] || item.status)} ${escHtml(item.resolved_at || '')}</span>`;
             card.innerHTML = `
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;">
-                    <span style="font-size:12px;color:var(--text-muted);">${escHtml(item.created_at || '')} · 来源 ${escHtml(item.source || '')} · 打算用 #${item.new_memory_id} 取代 #${item.old_memory_id}</span>
+                    <span style="font-size:12px;color:var(--text-muted);">${escHtml(item.created_at || '')} · 来源 ${escHtml(item.source || '')} · 打算用 ${newLabel} 取代 #${item.old_memory_id}</span>
                     <div style="display:flex;gap:6px;">${actions}</div>
                 </div>
                 <div style="font-size:13px;"><b>旧 #${item.old_memory_id}</b>${escHtml(oldState)}：<span style="text-decoration:line-through;opacity:.75;">${escHtml(item.old_content || '')}</span></div>
-                <div style="font-size:13px;margin-top:4px;"><b>新 #${item.new_memory_id}</b>${escHtml(newState)}：${escHtml(item.new_content || '')}</div>`;
+                <div style="font-size:13px;margin-top:4px;"><b>新 ${escHtml(newLabel)}</b>${escHtml(newState)}：${escHtml(item.new_content || '')}</div>`;
             card.querySelectorAll('button[data-act]').forEach(btn => {
                 btn.addEventListener('click', () => resolveProposal(item.id, btn.dataset.act));
             });
