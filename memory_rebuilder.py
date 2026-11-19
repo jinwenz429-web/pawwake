@@ -34,7 +34,7 @@ _ACTIVE_MEMORIES_SQL = """
                )
            ) AS was_rebuilt
     FROM memories m
-    WHERE m.is_active = TRUE
+    WHERE m.is_active = TRUE AND m.scope_session IS NULL
     ORDER BY m.id
 """
 

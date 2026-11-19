@@ -1465,6 +1465,7 @@ async function loadConversationList(page = 1) {
             container.innerHTML = '<div style="color: var(--error); padding: 20px 0;">加载失败: ' + data.error + '</div>';
             return;
         }
+        await loadSessionTags();
         renderConvList(data.conversations);
         renderConvPagination(data.page, data.total_pages, data.total);
         document.getElementById('conv-list-count').textContent = `共 ${data.total} 个对话`;
@@ -1540,6 +1541,10 @@ function renderConvList(conversations, isSearch = false) {
         const tokenStr = totalTokens > 0 ? (totalTokens >= 1000000 ? (totalTokens / 1000000).toFixed(1) + 'M' : totalTokens >= 1000 ? (totalTokens / 1000).toFixed(1) + 'K' : totalTokens) : '';
         const lastTime = conv.last_time || conv.updated_at || '';
         const timeStr = lastTime ? formatConvTime(lastTime) : '';
+        const tag = _sessionTags[sid];
+        const tagBadge = tag
+            ? `<span style="font-size: 11px; padding: 1px 6px; border-radius: 8px; margin-right: 6px; background: ${tag.kind === 'story' ? 'rgba(168,85,247,0.15)' : 'rgba(100,116,139,0.18)'};">${tag.kind === 'story' ? '剧情' : '工具'}${tag.name ? '·' + escapeHtml(tag.name) : ''}</span>`
+            : '';
         
         html += `
         <div class="conv-item" style="display: flex; align-items: flex-start; padding: 12px; border-bottom: 1px solid var(--border); transition: background 0.15s;"
@@ -1551,13 +1556,14 @@ function renderConvList(conversations, isSearch = false) {
             <div style="flex: 1; min-width: 0; cursor: pointer;" onclick="openConvDetail('${escapeHtml(sid)}')">
                 <div style="display: flex; justify-content: space-between; align-items: flex-start;">
                     <div style="flex: 1; min-width: 0;">
-                        <div style="font-weight: 500; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${title}</div>
+                        <div style="font-weight: 500; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${tagBadge}${title}</div>
                         <div style="color: var(--text-muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${preview}</div>
                     </div>
                     <div style="text-align: right; flex-shrink: 0; margin-left: 12px;">
                         <div style="color: var(--text-muted); font-size: 12px;">${timeStr}</div>
                         ${msgCount ? `<div style="color: var(--text-muted); font-size: 12px; margin-top: 2px;">${msgCount} 条</div>` : ''}
                         ${tokenStr ? `<div style="color: var(--text-muted); font-size: 11px; margin-top: 2px;">${tokenStr}</div>` : ''}
+                        <button class="btn btn-sm" style="font-size: 11px; margin-top: 4px;" onclick="event.stopPropagation(); setConvTag('${escapeHtml(sid)}')">标签</button>
                     </div>
                 </div>
             </div>
@@ -1565,6 +1571,48 @@ function renderConvList(conversations, isSearch = false) {
     }
     
     container.innerHTML = html;
+}
+
+// ---------- 对话线标签（主线 / 剧情 / 工具） ----------
+let _sessionTags = {};
+
+async function loadSessionTags() {
+    try {
+        const resp = await fetch('/api/session-tags');
+        const data = await resp.json();
+        _sessionTags = {};
+        for (const t of (data.tags || [])) _sessionTags[t.session_id] = t;
+    } catch (e) {
+        _sessionTags = {};
+    }
+}
+
+async function setConvTag(sid) {
+    const cur = _sessionTags[sid];
+    const curText = cur ? (cur.kind === 'story' ? '剧情 ' + (cur.name || '') : '工具') : '主线';
+    const input = prompt(
+        '这条对话线是什么？\n· 主线：共用记忆\n· 剧情 名字：剧情里的事只记在这条线里（例：剧情 猫妖篇）\n· 工具：不提取记忆',
+        curText.trim()
+    );
+    if (input === null) return;
+    const text = input.trim();
+    let kind = 'main', name = '';
+    if (text.startsWith('剧情')) { kind = 'story'; name = text.slice(2).trim(); }
+    else if (text.startsWith('工具')) { kind = 'tool'; }
+    else if (text && !text.startsWith('主线')) { alert('请写「主线」「剧情 名字」或「工具」'); return; }
+    try {
+        const resp = await fetch('/api/session-tags/' + encodeURIComponent(sid), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind, name })
+        });
+        const data = await resp.json();
+        if (data.error) { alert('设置失败: ' + data.error); return; }
+        if (data.moved) alert(`已设置，顺带挪了 ${data.moved} 条记忆`);
+        loadConversationList(convCurrentPage || 1);
+    } catch (e) {
+        alert('设置失败: ' + e.message);
+    }
 }
 
 // 渲染分页

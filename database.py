@@ -7,6 +7,7 @@
 - 存储/检索记忆（带中文分词和加权排序）
 """
 
+import session_scope
 import os
 import re
 import json
@@ -302,6 +303,40 @@ async def init_tables():
         await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind TEXT DEFAULT NULL")
         await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_until DATE DEFAULT NULL")
         await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by INTEGER DEFAULT NULL")
+
+        # 对话线分区：剧情线 / 工具线里提取的记忆记在这条线名下，不进主线记忆池
+        await conn.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS scope_session TEXT DEFAULT NULL")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_scope_session ON memories (scope_session) "
+            "WHERE scope_session IS NOT NULL"
+        )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS session_tags (
+                session_id  TEXT PRIMARY KEY,
+                kind        TEXT NOT NULL,
+                name        TEXT,
+                source      TEXT,
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        # 新记忆一入库就按来源对话线归位：不用改每一处 INSERT
+        await conn.execute("""
+            CREATE OR REPLACE FUNCTION pawwake_scope_new_memory() RETURNS trigger AS $$
+            BEGIN
+                IF NEW.scope_session IS NULL AND NEW.source_session IS NOT NULL THEN
+                    SELECT t.session_id INTO NEW.scope_session
+                    FROM session_tags t
+                    WHERE t.session_id = NEW.source_session AND t.kind IN ('story', 'tool');
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+        """)
+        await conn.execute("DROP TRIGGER IF EXISTS trg_scope_new_memory ON memories")
+        await conn.execute("""
+            CREATE TRIGGER trg_scope_new_memory BEFORE INSERT ON memories
+            FOR EACH ROW EXECUTE FUNCTION pawwake_scope_new_memory()
+        """)
 
         # 「用新记忆取代旧记忆」的提议（MEMORY_UPDATE_MODE=observe 时只记在这里，等人工采纳）
         await conn.execute("""
@@ -2236,7 +2271,7 @@ async def search_memories(query: str, limit: int = 10):
         
         # 至少命中一个关键词（只搜索活跃记忆）
         where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
-        where_clause = f"is_active = TRUE AND superseded_by IS NULL AND ({' OR '.join(where_parts)})"
+        where_clause = f"is_active = TRUE AND superseded_by IS NULL{session_scope.scope_sql()} AND ({' OR '.join(where_parts)})"
         
         limit_idx = len(keywords) + 1
         params.append(limit)
@@ -2330,7 +2365,7 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
             hit_count_expr = " + ".join(case_parts)
             max_hits = len(keywords)
             where_parts = [f"content ILIKE '%' || ${i+1} || '%'" for i in range(len(keywords))]
-            where_clause = f"is_active = TRUE AND superseded_by IS NULL AND ({' OR '.join(where_parts)})"
+            where_clause = f"is_active = TRUE AND superseded_by IS NULL{session_scope.scope_sql()} AND ({' OR '.join(where_parts)})"
             
             limit_idx = len(keywords) + 1
             params.append(limit * 3)
@@ -2365,23 +2400,23 @@ async def search_memories_hybrid(query: str, limit: int = 10, return_mode: bool 
         if query_embedding:
             if HAS_PGVECTOR:
                 vec_str = '[' + ','.join(str(f) for f in query_embedding) + ']'
-                sem_rows = await conn.fetch("""
+                sem_rows = await conn.fetch(f"""
                     SELECT id, content, importance, created_at, event_date,
                            kind, valid_until, layer,
                            1 - (embedding <=> $1::vector) as similarity
                     FROM memories
                     WHERE embedding IS NOT NULL AND is_active = TRUE
-                      AND superseded_by IS NULL
+                      AND superseded_by IS NULL{session_scope.scope_sql()}
                     ORDER BY embedding <=> $1::vector
                     LIMIT $2
                 """, vec_str, limit * 3)
             else:
                 # Python端计算cosine
-                all_mem = await conn.fetch("""
+                all_mem = await conn.fetch(f"""
                     SELECT id, content, importance, created_at, event_date,
                            kind, valid_until, layer, embedding_json
                     FROM memories WHERE embedding_json IS NOT NULL AND is_active = TRUE
-                      AND superseded_by IS NULL
+                      AND superseded_by IS NULL{session_scope.scope_sql()}
                 """)
                 
                 scored = []
@@ -2789,13 +2824,109 @@ async def get_recent_memories(limit: int = 20):
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.fetch(
-            """SELECT id, content, importance, created_at, event_date, kind
+            f"""SELECT id, content, importance, created_at, event_date, kind
                FROM memories
-               WHERE is_active = TRUE
+               WHERE is_active = TRUE{session_scope.scope_sql()}
                ORDER BY created_at DESC
                LIMIT $1""",
             limit,
         )
+
+
+# ============================================================
+# 对话线标签（主线 / 剧情 / 工具）
+# ============================================================
+
+_session_tag_cache: dict = {}
+_session_tag_cache_loaded = False
+
+
+async def _load_session_tags():
+    global _session_tag_cache_loaded
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT session_id, kind, name, source, updated_at FROM session_tags")
+    _session_tag_cache.clear()
+    for row in rows:
+        _session_tag_cache[row["session_id"]] = dict(row)
+    _session_tag_cache_loaded = True
+
+
+async def get_session_tag(session_id):
+    """这条线的标签；没打过标签（主线）返回 None。读一次后走进程内缓存。"""
+    if not session_id:
+        return None
+    if not _session_tag_cache_loaded:
+        await _load_session_tags()
+    return _session_tag_cache.get(session_id)
+
+
+async def list_session_tags():
+    await _load_session_tags()
+    return sorted(_session_tag_cache.values(), key=lambda t: str(t.get("updated_at") or ""), reverse=True)
+
+
+async def set_session_tag(session_id: str, kind: str, name: str | None = None, source: str = "dashboard"):
+    """给一条线打标签，并把这条线已经提取的记忆一起挪过去（改回主线就挪回主池）。
+
+    返回 {"kind", "name", "moved"}；moved 是被挪动的记忆条数。
+    """
+    if kind not in session_scope.KINDS:
+        raise ValueError(f"未知的对话线类型: {kind}")
+    if not session_id:
+        raise ValueError("缺少 session_id")
+    name = (name or "").strip()[:40] or None
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if kind == session_scope.MAIN:
+                await conn.execute("DELETE FROM session_tags WHERE session_id = $1", session_id)
+                moved = await conn.execute(
+                    "UPDATE memories SET scope_session = NULL WHERE scope_session = $1", session_id,
+                )
+            else:
+                await conn.execute(
+                    """INSERT INTO session_tags (session_id, kind, name, source, updated_at)
+                       VALUES ($1, $2, $3, $4, NOW())
+                       ON CONFLICT (session_id) DO UPDATE
+                       SET kind = EXCLUDED.kind,
+                           name = COALESCE(EXCLUDED.name, session_tags.name),
+                           source = EXCLUDED.source,
+                           updated_at = NOW()""",
+                    session_id, kind, name, source,
+                )
+                moved = await conn.execute(
+                    """UPDATE memories SET scope_session = $1
+                       WHERE source_session = $1 AND scope_session IS NULL""",
+                    session_id,
+                )
+    await _load_session_tags()
+    try:
+        moved_count = int(str(moved).split()[-1])
+    except (ValueError, IndexError):
+        moved_count = 0
+    tag = _session_tag_cache.get(session_id)
+    return {"kind": kind, "name": (tag or {}).get("name"), "moved": moved_count}
+
+
+async def get_memory_scope_labels(memory_ids):
+    """{记忆编号: 剧情线名字}，只返回不在主线池里的那些（MCP 搜索结果打标签用）。"""
+    ids = [int(i) for i in memory_ids or []]
+    if not ids:
+        return {}
+    if not _session_tag_cache_loaded:
+        await _load_session_tags()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, scope_session FROM memories WHERE id = ANY($1::int[]) AND scope_session IS NOT NULL",
+            ids,
+        )
+    labels = {}
+    for row in rows:
+        tag = _session_tag_cache.get(row["scope_session"]) or {}
+        labels[int(row["id"])] = tag.get("name") or "未命名剧情"
+    return labels
 
 
 async def get_core_memories(limit: int = 8):
@@ -2808,12 +2939,13 @@ async def get_core_memories(limit: int = 8):
         return []
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # 剧情线里：主线的核心记忆排前面，剧情自己的核心记忆补在后面
         rows = await conn.fetch(
-            """SELECT id, content, importance, created_at, event_date,
+            f"""SELECT id, content, importance, created_at, event_date,
                       kind, valid_until, layer, title
                FROM memories
-               WHERE is_active = TRUE AND layer = 3 AND superseded_by IS NULL
-               ORDER BY importance DESC, id ASC
+               WHERE is_active = TRUE AND layer = 3 AND superseded_by IS NULL{session_scope.scope_sql()}
+               ORDER BY (scope_session IS NOT NULL), importance DESC, id ASC
                LIMIT $1""",
             int(limit),
         )
