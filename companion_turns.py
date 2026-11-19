@@ -30,6 +30,27 @@ def is_proactive_cue(text: str) -> bool:
     return isinstance(text, str) and text.lstrip().startswith(PROACTIVE_CUE_OPENING)
 
 
+# Kelivo only appends its wake cue on the first try. Regenerating a failed or
+# unwanted proactive message rebuilds the request without it, so the request
+# ends with the model's own previous reply, which Gemini rejects with
+# "Requests ending with a model turn are not supported".
+CONTINUATION_CUE = (
+    PROACTIVE_CUE_OPENING
+    + "对方没有发新消息。这一轮还是你主动开口（多半是刚才那次没发出去，重来一次）。"
+    "顺着上面的对话自然地说，别提这条提示。"
+)
+
+
+def ends_with_model_turn(messages: list) -> bool:
+    """True when the last non-system message is a finished assistant reply."""
+    for message in reversed(messages or []):
+        role = message.get("role")
+        if role == "system":
+            continue
+        return role == "assistant" and not message.get("tool_calls")
+    return False
+
+
 def is_silence(text: str) -> bool:
     return bool(_SILENCE.match(text or ""))
 

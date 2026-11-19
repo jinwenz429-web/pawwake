@@ -685,6 +685,18 @@ class DeletedAssistantTests(unittest.TestCase):
         self.assertEqual(main.find_deleted_assistant_rounds(db, repeat), [])
         self.assertEqual(main.find_deleted_assistant_rounds(db, reroll), [])
 
+    def test_deleted_proactive_reply_keeps_the_reply_before_it(self):
+        # 主动消息前面没有新的 user：删它时不能把上一条回复一起删掉。
+        db = [
+            {"id": 1, "role": "user", "content": "one"},
+            {"id": 2, "role": "assistant", "content": "reply one"},
+            {"id": 3, "role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+            {"id": 4, "role": "tool", "content": "{}"},
+            {"id": 5, "role": "assistant", "content": "proactive"},
+        ]
+        client = db[:2] + [{"role": "user", "content": "two"}]
+        self.assertEqual(main.find_deleted_assistant_rounds(db, client), [(2, 5)])
+
     def test_new_memory_records_exact_cited_message_ids(self):
         saved = []
         extracted_input = []

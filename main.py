@@ -1295,18 +1295,22 @@ def find_deleted_assistant_rounds(db_messages: list, client_messages: list) -> l
     if not client or client[-1].get("role") != "user":
         return []
 
+    # 每条回复记下它前面最近的边界（user，或上一条普通回复）。删除只删边界之后到这条回复
+    # 为止的助手/工具行：主动消息前面没有新的 user，按 user 当边界会把上一条回复一起删掉。
     db_visible = []
-    last_user_id = None
+    boundary_id = None
     for message in db_messages:
         role = message.get("role")
         if role == "user":
-            last_user_id = message.get("id")
+            boundary_id = message.get("id")
         if role not in ("user", "assistant") or message.get("tool_calls"):
             continue
         content = message.get("content")
         if not isinstance(content, str) or not content:
             continue
-        db_visible.append((role, content, message.get("id"), last_user_id))
+        db_visible.append((role, content, message.get("id"), boundary_id))
+        if role == "assistant":
+            boundary_id = message.get("id")
 
     client_visible = [
         (m.get("role"), m.get("content"))
@@ -2838,6 +2842,14 @@ async def _chat_completions_inner(request: Request):
     if auxiliary_suggestion_request:
         print("⏭️  检测到聊天建议请求：跳过分区缓存、记忆注入、对话存储和会话 Token 统计")
     
+    # ---------- 以它自己那句结尾的请求（重新生成主动消息） ----------
+    # Kelivo 重来一次主动消息时不会再带醒来提示，请求停在它自己上一句上，
+    # Gemini 会直接 400。补一条隐藏提示，当作主动回合处理（不存、不提取记忆）。
+    if not skip_conversation_log and companion_turns.ends_with_model_turn(messages):
+        messages.append({"role": "user", "content": companion_turns.CONTINUATION_CUE})
+        body["messages"] = messages
+        print("🌙 请求以它自己那句结尾（重来主动消息），补上隐藏提示", flush=True)
+
     # ---------- 提取用户最新消息 ----------
     user_message = ""
     for msg in reversed(messages):

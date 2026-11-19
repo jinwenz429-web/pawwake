@@ -900,7 +900,11 @@ async def archive_replaced_answer_memories(
 
 
 async def delete_assistant_rounds(session_id: str, round_ids: list) -> bool:
-    """Remove confirmed deleted replies and their tool rows, keeping user turns."""
+    """Remove confirmed deleted replies and their tool rows, keeping user turns.
+
+    Each pair is (boundary_id, assistant_id): the boundary is the user turn or the
+    previous plain reply before it; rows strictly after it are removed.
+    """
     if not round_ids:
         return True
     pool = await get_pool()
@@ -926,7 +930,7 @@ async def delete_assistant_rounds(session_id: str, round_ids: list) -> bool:
                     session_id, user_id, assistant_id,
                 )
                 if (
-                    not user or user["role"] != "user"
+                    not user or user["role"] not in ("user", "assistant")
                     or not assistant or assistant["role"] != "assistant"
                     or intervening_user
                 ):
