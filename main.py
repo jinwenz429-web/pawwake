@@ -46,6 +46,8 @@ from database import (
 )
 from database import init_tables, close_pool, save_message, search_memories, save_memory, save_memory_deduplicated, dedupe_active_fragment_memories, get_all_memories_count, get_recent_memories, get_all_memories, get_pool, get_all_memories_detail, delete_archived_memory, delete_archived_memories_batch, soft_delete_memories_batch, restore_archived_memories_batch, get_gateway_config, set_gateway_config, get_all_gateway_config, get_conversation_messages, get_session_cache_state, save_session_cache_state, delete_session_cache_state, save_token_usage, ensure_token_usage_table, get_conversations_paginated, replace_last_conversation_round, archive_replaced_answer_memories, delete_assistant_rounds, delete_auxiliary_suggestion_messages, delete_redundant_reroll_tail, db_row_to_message, backfill_memory_embeddings, get_pending_memory_embedding_count, search_conversations, update_message_content, delete_single_message, rename_session_id, get_fragments_by_date, create_consolidated_events, promote_to_core, merge_memories, check_duplicate_memory, update_memory_with_layer, get_layer_statistics, cleanup_old_fragments, revert_merge
 from database import search_chat_fragments, rebuild_content_tsv, kick_embedding_backfill, get_embedding_backfill_status, mark_fragments_seen
+from database import get_session_tag, set_session_tag, list_session_tags, get_memory_scope_labels
+import session_scope
 from database import get_active_memories_count, get_core_memories, get_memory_by_id, compute_valid_until, get_last_user_message_id
 from database import list_update_proposals, resolve_update_proposal, ProposalConflict
 from database import get_conversation_tail
@@ -2072,6 +2074,15 @@ async def _extract_and_store_memories(
     guard_meta,
 ):
     """提取 + 入库。调用方负责拿按 session 的锁。"""
+    try:
+        line_tag = await get_session_tag(session_id)
+    except Exception:
+        line_tag = None
+    if line_tag and line_tag.get("kind") == session_scope.TOOL:
+        print("⏭️  工具线：不提取记忆", flush=True)
+        return
+    # 剧情线提取时对比「主线 + 这条剧情线」的记忆；入库时由数据库触发器把新记忆归到这条线名下
+    session_scope.CURRENT_SCOPE.set(session_scope.scope_for(line_tag))
     
     # 4. 按逻辑轮截取近期上下文，而非发送完整会话。
     if context_messages:
@@ -2457,13 +2468,24 @@ def _parse_tool_date(value):
 async def _mcp_search_memory(query: str, limit: int) -> str:
     if not MEMORY_ENABLED:
         return "记忆系统没有开启。"
-    memories = await search_memories(query, limit=limit)
+    # MCP 搜索看得到所有对话线的记忆；剧情线里的会标出处，免得当成现实里发生的事
+    token = session_scope.CURRENT_SCOPE.set(session_scope.ALL)
+    try:
+        memories = await search_memories(query, limit=limit)
+    finally:
+        session_scope.CURRENT_SCOPE.reset(token)
     if not memories:
         return "没有查到相关记忆。"
+    try:
+        story_labels = await get_memory_scope_labels([mem["id"] for mem in memories])
+    except Exception:
+        story_labels = {}
     today = _local_today()
     lines = []
     for mem in memories:
         line = _format_memory_line(mem, today)
+        if int(mem["id"]) in story_labels:
+            line = f"【剧情《{story_labels[int(mem['id'])]}》里的事，不是现实】" + line
         if MEMORY_MCP_WRITE_ENABLED:
             line += f"（记忆 #{mem['id']}）"
         lines.append(line)
@@ -2486,10 +2508,20 @@ async def _mcp_remember(content: str, kind: str, event_date_text: str | None) ->
     event_date = _parse_tool_date(event_date_text)
     if any(word in content for word in META_BLACKLIST):
         return "这条是在讨论记忆系统本身，没有记。"
+    # 工具调用不带对话编号：刚刚在聊的那条线要是剧情/工具线，就记在它名下
+    source_session = "mcp"
+    recent_sid = session_scope.recent_chat_session()
+    if recent_sid:
+        try:
+            recent_tag = await get_session_tag(recent_sid)
+        except Exception:
+            recent_tag = None
+        if recent_tag and recent_tag.get("kind") in (session_scope.STORY, session_scope.TOOL):
+            source_session = recent_sid
     result = await save_memory_deduplicated(
         content=content,
         importance=6,
-        source_session="mcp",
+        source_session=source_session,
         kind=kind,
         event_date=event_date,
         valid_until=compute_valid_until(kind, event_date, _local_today()),
@@ -2820,6 +2852,22 @@ async def _chat_completions_inner(request: Request):
                 )
             break
 
+    # ---------- 对话线标签：消息开头的 #剧情 名字 / #工具 ----------
+    # 标记从所有 user 消息里剥掉（客户端会把整段历史带回来），只拿最新一条的标记来打标签。
+    pending_scope_tag = None
+    if not skip_conversation_log:
+        latest_user_index = max(
+            (i for i, m in enumerate(messages) if m.get("role") == "user"), default=None,
+        )
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "user":
+                continue
+            parsed = session_scope.strip_marker_from_message(msg)
+            if parsed and i == latest_user_index:
+                pending_scope_tag = parsed
+        if pending_scope_tag:
+            user_message = pending_scope_tag[2]
+
     # ---------- Kelivo 主动回合（它自己醒来找你） ----------
     # 末尾那条 user 是只有它看得到的提示，不是用户说的话：不存、不提取记忆、不做出戏判断。
     proactive_turn = not skip_conversation_log and companion_turns.is_proactive_cue(user_message)
@@ -2864,6 +2912,22 @@ async def _chat_completions_inner(request: Request):
         PARTITION_SESSION_ID,
         generated_session_id,
     )
+
+    # ---------- 对话线分区：决定这一轮能召回哪些记忆 ----------
+    session_tag = None
+    if not skip_conversation_log:
+        try:
+            if pending_scope_tag:
+                kind, name, _ = pending_scope_tag
+                result = await set_session_tag(session_id, kind, name, source="marker")
+                print(f"🏷️ 这条对话线标成「{session_scope.KIND_LABELS[kind]}」"
+                      f"{'：' + result['name'] if result.get('name') else ''}"
+                      f"（挪了 {result['moved']} 条记忆）", flush=True)
+            session_tag = await get_session_tag(session_id)
+        except Exception as e:
+            print(f"⚠️ 读取对话线标签失败（按主线处理）: {type(e).__name__}", flush=True)
+        session_scope.CURRENT_SCOPE.set(session_scope.scope_for(session_tag))
+        session_scope.note_chat_session(session_id)
     
     # ---------- 分区缓存模式 ----------
     if CACHE_PARTITION_ENABLED and not skip_conversation_log:
@@ -4779,6 +4843,28 @@ async def api_delete_diary(diary_id: int):
     if not deleted:
         return JSONResponse(status_code=404, content={"error": "Diary not found."})
     return {"ok": True}
+
+
+@app.get("/api/session-tags")
+async def api_session_tags():
+    try:
+        tags = await list_session_tags()
+        return {"tags": [{**t, "updated_at": str(t.get("updated_at") or "")} for t in tags]}
+    except Exception:
+        return _api_failure("加载对话线标签失败")
+
+
+@app.put("/api/session-tags/{session_id}")
+async def api_set_session_tag(session_id: str, request: Request):
+    data = await request.json()
+    kind = str(data.get("kind") or "").strip()
+    if kind not in session_scope.KINDS:
+        return JSONResponse(status_code=400, content={"error": "kind 只能是 main / story / tool"})
+    try:
+        result = await set_session_tag(session_id, kind, data.get("name"), source="dashboard")
+        return {"status": "ok", **result}
+    except Exception:
+        return _api_failure("设置对话线标签失败")
 
 
 @app.get("/api/conversations")
