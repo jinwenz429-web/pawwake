@@ -19,6 +19,7 @@ import re
 import uuid
 import asyncio
 import base64
+import functools
 import hashlib
 import hmac
 import logging
@@ -487,6 +488,24 @@ app = FastAPI(title="Pawwake", version="4.0.3", lifespan=lifespan)
 # 静态文件和模板配置
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
+
+
+@functools.lru_cache(maxsize=None)
+def static_asset(path: str) -> str:
+    """模板里引用静态文件用：/static/<path>?v=<文件内容哈希>。
+
+    文件一改，版本号就跟着变，浏览器不会再拿缓存里的旧脚本（曾经因为忘了手动
+    改 ?v= 导致 Dashboard 的新设置项保存不上）。每次部署进程重启，缓存随之清空。
+    """
+    try:
+        with open(os.path.join("static", path), "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()[:10]
+    except OSError:
+        digest = "0"
+    return f"/static/{path}?v={digest}"
+
+
+templates.env.globals["static_asset"] = static_asset
 
 
 # ============================================================
