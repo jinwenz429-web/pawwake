@@ -149,6 +149,32 @@ class KelivoDirectTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent_cue.startswith(companion_turns.PROACTIVE_CUE_OPENING))
         self.assertIn("昨晚想她", sent_cue)
 
+    async def test_regenerated_proactive_message_gets_a_hidden_cue(self):
+        # Kelivo 重来一次主动消息时不带醒来提示，请求停在它自己上一句上。
+        with self.boundaries([httpx.Response(200, json=completion("刚才没发出去，再来找你"))]):
+            response = await main._chat_completions_inner(FakeRequest([
+                {"role": "user", "content": "你今天都没来找我"},
+                {"role": "assistant", "content": "讨厌我？"},
+            ]))
+            await settle()
+        self.assertEqual(response.status_code, 200)
+        sent = self.upstream[0]["messages"]
+        self.assertEqual(sent[-1]["role"], "user")
+        self.assertTrue(companion_turns.is_proactive_cue(sent[-1]["content"]))
+        self.assertEqual(self.saved, [("assistant", "刚才没发出去，再来找你")])
+
+    async def test_request_ending_with_tool_call_is_left_alone(self):
+        self.assertFalse(companion_turns.ends_with_model_turn([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        ]))
+        self.assertFalse(companion_turns.ends_with_model_turn([
+            {"role": "assistant", "content": "x"}, {"role": "tool", "content": "{}"},
+        ]))
+        self.assertTrue(companion_turns.ends_with_model_turn([
+            {"role": "assistant", "content": "x"}, {"role": "system", "content": "s"},
+        ]))
+
     async def test_silent_proactive_turn_stores_nothing_but_the_diary(self):
         with self.boundaries([httpx.Response(200, json=completion("[静默]\n[DIARY]她在睡[/DIARY]"))]):
             await main._chat_completions_inner(FakeRequest([{"role": "user", "content": CUE}]))
