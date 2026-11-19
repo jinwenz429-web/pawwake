@@ -334,6 +334,12 @@ def _validate_actions(source_ids, actions, existing_ids=None):
         ids = [int(value) for value in (raw.get("source_ids") or [])]
         if not ids:
             raise ValueError("action 缺少 source_ids")
+        if action == "MERGE" and len(ids) == 1:
+            # 模型常把「单条升为核心记忆」写成只有一条来源的 MERGE。以前直接报错，
+            # 整个领域的整理预览都会失败；按「只合并不压缩」改成 KEEP 升到 layer 3，
+            # 保留原文，不用模型的改写版本。
+            action = "KEEP"
+            raw = dict(raw, target_layer=3)
         if action == "KEEP" and len(ids) != 1:
             raise ValueError("KEEP 只能覆盖一条来源")
         if action == "MERGE" and len(ids) < 2:

@@ -246,3 +246,21 @@ class ProposalAcceptTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SingleSourceMergeTests(unittest.TestCase):
+    def test_single_source_merge_becomes_keep_on_core_layer(self):
+        merge = {"action": "MERGE", "source_ids": [5], "content": "改写过的版本",
+                 "title": "考研目标", "importance": 7, "reason": "升为核心"}
+        [item] = rebuilder._validate_actions([5], [merge])
+        self.assertEqual(item["action"], "KEEP")
+        self.assertEqual(item["target_layer"], 3)
+        self.assertEqual(item["source_ids"], [5])
+
+    def test_single_source_merge_does_not_break_the_rest_of_the_plan(self):
+        actions = [
+            {"action": "MERGE", "source_ids": [1], "content": "x"},
+            {"action": "MERGE", "source_ids": [2, 3], "content": "合并", "title": "t"},
+        ]
+        result = rebuilder._validate_actions([1, 2, 3], actions)
+        self.assertEqual([a["action"] for a in result], ["KEEP", "MERGE"])
