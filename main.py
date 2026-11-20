@@ -64,6 +64,7 @@ from memory_rebuilder import (
 )
 from diary_store import ensure_dylan_diary_table, save_dylan_diary, recent_diaries, list_diaries, delete_diary
 import companion_turns
+import call_mode
 import persona_guard
 from persona_guard_store import ensure_persona_guard_table, save_quarantine, recent_quarantine_fingerprints
 
@@ -2076,8 +2077,14 @@ async def _extract_and_store_memories(
     stored_user_id,
     stored_assistant_id,
     guard_meta,
+    prepared_messages: list = None,
+    synthetic_roles: dict = None,
 ):
-    """提取 + 入库。调用方负责拿按 session 的锁。"""
+    """提取 + 入库。调用方负责拿按 session 的锁。
+
+    prepared_messages：调用方已经排好的提取消息（语音通话按句拆开，每句一个临时编号）；
+    synthetic_roles：临时编号 → 谁说的，入库前换回真正的 user / assistant 行编号。
+    """
     try:
         line_tag = await get_session_tag(session_id)
     except Exception:
@@ -2089,7 +2096,10 @@ async def _extract_and_store_memories(
     session_scope.CURRENT_SCOPE.set(session_scope.scope_for(line_tag))
     
     # 4. 按逻辑轮截取近期上下文，而非发送完整会话。
-    if context_messages:
+    if prepared_messages:
+        messages_for_extraction = prepared_messages
+        print(f"📝 语音通话：按句提取记忆（{len(messages_for_extraction)} 句）")
+    elif context_messages:
         extraction_context = [dict(message) for message in context_messages]
         if stored_user_id:
             for message in reversed(extraction_context):
@@ -2141,6 +2151,10 @@ async def _extract_and_store_memories(
             print(f"🚫 跳过来源不合格的提取结果（没有用户消息作来源）: {content[:60]}")
             rejected_source += 1
             continue
+        if synthetic_roles:
+            verified = call_mode.map_source_ids(
+                verified, synthetic_roles, stored_user_id, stored_assistant_id,
+            )
         mem["verified_source_ids"] = verified
         filtered_memories.append(mem)
 
@@ -2815,6 +2829,11 @@ async def _chat_completions_inner(request: Request):
     auxiliary_suggestion_request = _is_chat_suggestion_request(messages)
     skip_conversation_log = explicit_skip or auxiliary_title_request or auxiliary_suggestion_request
 
+    # ---------- 语音通话：只取不存，挂断后整通电话另外入库 ----------
+    call_id = call_mode.call_id_from_headers(request.headers)
+    if call_id and not skip_conversation_log:
+        return await _call_turn(request, body, messages, call_id)
+
     # ---------- Persona Guard：剔除已隔离的漂移回复（客户端会把它原样带回来） ----------
     guard_meta = None
     if not skip_conversation_log and persona_guard.guard_applies_to_model(body.get("model") or DEFAULT_MODEL):
@@ -3435,6 +3454,204 @@ async def _chat_completions_inner(request: Request):
                 except Exception:
                     error_content = {"error": {"message": response.text[:500], "type": "upstream_error"}}
                 return JSONResponse(status_code=response.status_code, content=error_content)
+
+
+async def _build_call_context(session_id: str, client_system_text: str) -> "call_mode.CallContext":
+    """接通时备一次的精简底子：人设 + 核心记忆 + 十来条相关记忆 + 摘要 + 最近几轮聊天。"""
+    memory_on = MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED
+    parts = [await get_system_prompt() or ""]
+    core = await _load_core_memories()
+    if memory_on and (MAX_MEMORIES_INJECT > 0 or core):
+        parts.append(MEMORY_USAGE_GUIDE.strip())
+    core_block = format_core_memory_block(core)
+    if core_block:
+        parts.append(core_block)
+
+    recent = []
+    summary_parts = []
+    try:
+        rows = await get_conversation_tail(session_id, call_mode.RECENT_ROUNDS * 8 + 8)
+        recent = call_mode.recent_history(
+            [db_row_to_message(row) for row in rows], call_mode.RECENT_ROUNDS,
+        )
+        summary_parts = list((await get_session_cache_state(session_id))["summary_parts"])
+    except Exception as e:
+        print(f"⚠️ 通话底子：读取聊天记录/摘要失败（这通电话不带）: {type(e).__name__}", flush=True)
+
+    memory_ids = {int(mem["id"]) for mem in core}
+    if memory_on and call_mode.BASE_MEMORIES > 0:
+        query = build_recall_query(recent, MEMORY_RECALL_QUERY_ROUNDS)
+        try:
+            mems = await search_memories_excluding(query, call_mode.BASE_MEMORIES, memory_ids)
+        except Exception as e:
+            print(f"⚠️ 通话底子：记忆检索失败: {type(e).__name__}", flush=True)
+            mems = []
+        if mems:
+            today = _local_today()
+            parts.append(call_mode.memory_block(
+                ["以下是网关在电话接通时检索的相关记忆，供参考："]
+                + [_format_memory_line(mem, today) for mem in mems],
+                "retrieved_memories",
+            ))
+            memory_ids |= {int(mem["id"]) for mem in mems}
+    if client_system_text:
+        parts.append(client_system_text)
+    system_text = "\n\n".join(part for part in parts if part)
+    print(
+        f"📞 通话底子：记忆 {len(memory_ids)} 条，摘要 {len(summary_parts)} 段，"
+        f"最近 {len(recent)} 条聊天，系统提示 {len(system_text)} 字",
+        flush=True,
+    )
+    return call_mode.CallContext(
+        session_id=session_id,
+        system_text=system_text,
+        summary_parts=summary_parts,
+        recent_messages=recent,
+        memory_ids=memory_ids,
+    )
+
+
+async def _call_turn(request: Request, body: dict, messages: list, call_id: str):
+    """语音通话里的一轮：精简底子 + 这通电话到目前为止 + 按刚说的话补搜几条记忆。不存、不提取。"""
+    session_id, _ = resolve_effective_session_id(
+        request.headers.get("X-Conversation-Id", ""), body, PARTITION_SESSION_ID,
+        str(uuid.uuid4())[:8],
+    )
+    try:
+        session_tag = await get_session_tag(session_id)
+    except Exception:
+        session_tag = None
+    session_scope.CURRENT_SCOPE.set(session_scope.scope_for(session_tag))
+
+    context = call_mode.CONTEXTS.get(call_id)
+    if context is None or context.session_id != session_id:
+        context = await _build_call_context(session_id, _extract_client_system_text(messages))
+        call_mode.CONTEXTS.put(call_id, context)
+
+    turns = call_mode.call_messages(m for m in messages if m.get("role") != "system")
+    if not call_mode.ends_awaiting_reply(turns):
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "A call turn must end with what the user said, a hidden cue, or tool results.",
+            "type": "invalid_call_turn",
+        }})
+    latest = call_mode.latest_user_text(turns)
+    turn_memory_text = ""
+    if (
+        MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and call_mode.TURN_MEMORIES > 0
+        and latest and not companion_turns.is_proactive_cue(latest)
+        and turns[-1]["role"] == "user"
+    ):
+        try:
+            mems = await search_memories_excluding(latest, call_mode.TURN_MEMORIES, context.memory_ids)
+        except Exception as e:
+            print(f"⚠️ 通话补搜记忆失败: {type(e).__name__}", flush=True)
+            mems = []
+        if mems:
+            today = _local_today()
+            turn_memory_text = call_mode.memory_block(
+                ["和对方刚说的话相关的记忆，供参考，非对方本次输入："]
+                + [_format_memory_line(mem, today) for mem in mems],
+                "retrieved_memories",
+            )
+    body["messages"] = call_mode.build_messages(
+        context, turns, build_time_injection(), turn_memory_text,
+    )
+    if MEMORY_ENABLED and _request_has_tool(body, "search_memory"):
+        hint = call_mode.CALL_SEARCH_HINT
+        first = body["messages"][0] if body["messages"] else None
+        if first and first.get("role") == "system":
+            first["content"] = f"{first['content']}\n\n{hint}"
+        else:
+            body["messages"].insert(0, {"role": "system", "content": hint})
+    model = body.get("model") or DEFAULT_MODEL
+    body["model"] = model
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    if "openrouter" in API_BASE_URL:
+        headers["HTTP-Referer"] = EXTRA_REFERER
+        headers["X-Title"] = EXTRA_TITLE
+    is_stream = bool(body.get("stream")) or FORCE_STREAM
+    body["stream"] = is_stream
+    print(
+        f"📞 通话一轮: model={model}, 本通 {len(turns)} 段, 补搜记忆 {'有' if turn_memory_text else '无'}, "
+        f"reasoning={body.get('reasoning_effort', '-')}",
+        flush=True,
+    )
+    if is_stream:
+        return StreamingResponse(
+            stream_and_capture(headers, body, session_id, "", model, skip_conversation_log=True),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(API_BASE_URL, headers=headers, json=body)
+    try:
+        data = response.json()
+    except ValueError:
+        return JSONResponse(status_code=502, content={"error": {
+            "message": "上游返回了无法解析的响应。", "type": "upstream_error",
+        }})
+    if response.status_code == 200:
+        failure = _upstream_failure(data, final=True)
+        if failure:
+            return JSONResponse(status_code=failure[0], content=failure[1])
+    return JSONResponse(status_code=response.status_code, content=data)
+
+
+@app.post("/v1/calls/{call_id}/transcript")
+async def save_call_transcript(call_id: str, request: Request):
+    """挂断后整通电话存成一轮，并按句提取一次记忆。返回存下的两条消息原文，客户端照抄进本地对话。"""
+    try:
+        payload = await request.json()
+        transcript = call_mode.parse_transcript(payload)
+    except (ValueError, call_mode.TranscriptError) as e:
+        return JSONResponse(status_code=400, content={"error": {"message": str(e), "type": "invalid_transcript"}})
+    session_id, _ = resolve_effective_session_id(
+        request.headers.get("X-Conversation-Id", ""), payload, PARTITION_SESSION_ID, "",
+    )
+    if not session_id:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "conversation id is required", "type": "invalid_transcript",
+        }})
+    call_mode.CONTEXTS.pop(call_id)
+    user_content, assistant_content = call_mode.stored_round(transcript, TIMEZONE_HOURS)
+    if not conversation_persistence_enabled():
+        return {"stored": False, "user_content": user_content, "assistant_content": assistant_content}
+
+    # 同一通电话重复上传（断网重试）不再存第二遍
+    try:
+        tail = await get_conversation_tail(session_id, 4)
+    except Exception:
+        tail = []
+    if any(row.get("role") == "user" and row.get("content") == user_content for row in tail):
+        return {"stored": True, "duplicate": True,
+                "user_content": user_content, "assistant_content": assistant_content}
+
+    model = str(payload.get("model") or "voice-call")[:80]
+    user_id = await save_message(session_id, "user", user_content, model)
+    assistant_id = await save_message(session_id, "assistant", assistant_content, model)
+    print(f"📞 通话记录入库：{len(transcript.lines)} 句（session id_hash={_partition_session_id_hash(session_id)}）", flush=True)
+
+    async def extract():
+        try:
+            tag = await get_session_tag(session_id)
+        except Exception:
+            tag = None
+        session_scope.CURRENT_SCOPE.set(session_scope.scope_for(tag))
+        if not (MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and MEMORY_EXTRACT_INTERVAL != 0):
+            return
+        prepared, roles = call_mode.extraction_messages(transcript)
+        try:
+            async with _extraction_lock(session_id):
+                await _extract_and_store_memories(
+                    session_id, user_content, assistant_content, None,
+                    user_id, assistant_id, None,
+                    prepared_messages=prepared, synthetic_roles=roles,
+                )
+        except Exception as e:
+            print(f"⚠️ 通话记忆提取失败: {e}", flush=True)
+
+    asyncio.create_task(extract())
+    return {"stored": True, "user_content": user_content, "assistant_content": assistant_content}
 
 
 def _parse_completion(resp_data: dict) -> tuple:
