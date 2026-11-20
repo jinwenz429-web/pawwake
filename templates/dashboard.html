@@ -782,6 +782,16 @@
                             <option value="high">high</option>
                         </select>
                     </div>
+                    <div class="settings-field">
+                        <label>备用模型 (FALLBACK_MODELS)</label>
+                        <input type="text" id="set-FALLBACK_MODELS" class="input" placeholder="例如 times/gemini-3.7-flash-compat, gemini-3.7-flash">
+                        <small class="form-hint">逗号分隔，按顺序试。当前模型限流、上游报错或迟迟不回时，自动换下一个再试一次（还没开始出字之前才会换）。留空就不换。</small>
+                    </div>
+                    <div class="settings-field">
+                        <label>等上游回应最多几秒 (UPSTREAM_HEADER_TIMEOUT)</label>
+                        <input type="number" id="set-UPSTREAM_HEADER_TIMEOUT" class="input" min="0" step="5">
+                        <small class="form-hint">流式请求超过这么久上游还没回，就换备用模型。0 表示一直等。最后一个模型总是一直等。</small>
+                    </div>
                 </div>
 
                 <!-- System Prompt -->
