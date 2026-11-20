@@ -231,6 +231,11 @@ FORCE_STREAM = os.getenv("FORCE_STREAM", "false").lower() == "true"
 # 设为 low/medium/high 会在转发请求时注入 reasoning_effort 参数
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
 
+# 上游卡住/限流时换模型再试：逗号分隔，按顺序试；不填就不换（行为和以前一样）。
+FALLBACK_MODELS = os.getenv("FALLBACK_MODELS", "")
+# 流式请求等上游回响应头最多几秒，超时就换下一个模型；0 表示不限（最后一个模型总是不限）。
+UPSTREAM_HEADER_TIMEOUT = int(os.getenv("UPSTREAM_HEADER_TIMEOUT", "30") or 0)
+
 # 记忆模型专用 API Key（不设则回退到主 API_KEY）
 # 适用于中转站按模型分组、不同模型需要不同 Key 的场景
 MEMORY_API_KEY = os.getenv("MEMORY_API_KEY", "")
@@ -386,6 +391,8 @@ async def lifespan(app: FastAPI):
                     "CACHE_TTL": str,
                     "FORCE_STREAM": lambda v: _parse_bool(v),
                     "REASONING_EFFORT": str,
+                    "FALLBACK_MODELS": str,
+                    "UPSTREAM_HEADER_TIMEOUT": lambda v: max(0, int(v)),
                 }
                 _RESTORE_DB = {
                     "EMBEDDING_API_KEY": str, "EMBEDDING_BASE_URL": str,
@@ -404,7 +411,7 @@ async def lifespan(app: FastAPI):
                     "MEMORY_UPDATE_MODE": lambda v: "apply" if str(v).strip().lower() == "apply" else "observe",
                 }
                 # 显式空值也要恢复，否则重启时环境默认会覆盖面板上的清空操作。
-                _ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL"}
+                _ALLOW_EMPTY = {"CACHE_SUMMARY_MODEL", "FALLBACK_MODELS"}
                 restored = []
                 for key, val in db_cfg.items():
                     if not val:
@@ -2781,6 +2788,86 @@ def _upstream_failure(payload, final=False):
     }}
 
 
+def _fallback_chain(model: str) -> list:
+    """当前模型在前，后面接 FALLBACK_MODELS 里的（去重）。"""
+    chain = [model]
+    for candidate in (FALLBACK_MODELS or "").split(","):
+        candidate = candidate.strip()
+        if candidate and candidate not in chain:
+            chain.append(candidate)
+    return chain
+
+
+def _retryable_upstream_status(status: int) -> bool:
+    """限流、超时、上游自己挂了才换模型；4xx（参数错、内容拦截）换了也没用。"""
+    return status in (408, 425, 429) or status >= 500
+
+
+@asynccontextmanager
+async def _open_upstream_stream(client, headers: dict, body: dict):
+    """按 _fallback_chain 打开流式请求。
+
+    只在还没给客户端吐任何东西之前换模型：响应头迟迟不来、连不上、或者回了
+    可重试的状态码。yield (response, 实际用的模型, 打不开时的 failure)。
+    """
+    chain = _fallback_chain(body.get("model") or DEFAULT_MODEL)
+    response = None
+    failure = None
+    used = chain[0]
+    for index, candidate in enumerate(chain):
+        last = index == len(chain) - 1
+        body["model"] = candidate
+        used = candidate
+        request = client.build_request("POST", API_BASE_URL, headers=headers, json=body)
+        try:
+            if not last and UPSTREAM_HEADER_TIMEOUT > 0:
+                attempt = await asyncio.wait_for(client.send(request, stream=True), UPSTREAM_HEADER_TIMEOUT)
+            else:
+                attempt = await client.send(request, stream=True)
+        except asyncio.TimeoutError:
+            if not last:
+                print(f"🔁 上游 {candidate} {UPSTREAM_HEADER_TIMEOUT} 秒没回，换 {chain[index + 1]} 再试", flush=True)
+                continue
+            failure = (504, {"error": {"message": "上游响应超时。", "type": "upstream_error", "code": "upstream_timeout"}})
+            break
+        except httpx.HTTPError as e:
+            if not last:
+                print(f"🔁 上游 {candidate} 连接失败（{type(e).__name__}），换 {chain[index + 1]} 再试", flush=True)
+                continue
+            failure = (502, {"error": {"message": "连不上上游。", "type": "upstream_error", "code": "upstream_unreachable"}})
+            break
+        if attempt.status_code != 200 and _retryable_upstream_status(attempt.status_code) and not last:
+            print(f"🔁 上游 {candidate} 回了 {attempt.status_code}，换 {chain[index + 1]} 再试", flush=True)
+            await attempt.aclose()
+            continue
+        response = attempt
+        break
+    try:
+        yield response, used, failure
+    finally:
+        if response is not None:
+            await response.aclose()
+
+
+async def _post_upstream_with_fallback(client, headers: dict, body: dict):
+    """非流式：连不上或可重试状态码时换下一个模型。返回 (response, 实际用的模型)。"""
+    chain = _fallback_chain(body.get("model") or DEFAULT_MODEL)
+    for index, candidate in enumerate(chain):
+        last = index == len(chain) - 1
+        body["model"] = candidate
+        try:
+            response = await client.post(API_BASE_URL, headers=headers, json=body)
+        except httpx.HTTPError as e:
+            if last:
+                raise
+            print(f"🔁 上游 {candidate} 连接失败（{type(e).__name__}），换 {chain[index + 1]} 再试", flush=True)
+            continue
+        if response.status_code != 200 and _retryable_upstream_status(response.status_code) and not last:
+            print(f"🔁 上游 {candidate} 回了 {response.status_code}，换 {chain[index + 1]} 再试", flush=True)
+            continue
+        return response, candidate
+
+
 def _upstream_failure_sse(failure):
     code = failure[1]["error"].get("code")
     safe_code = code if isinstance(code, str) and code in {
@@ -3353,7 +3440,7 @@ async def _chat_completions_inner(request: Request):
         )
     else:
         async with httpx.AsyncClient(timeout=300) as client:
-            response = await client.post(API_BASE_URL, headers=headers, json=body)
+            response, model = await _post_upstream_with_fallback(client, headers, body)
             
             if response.status_code == 200:
                 try:
@@ -3510,7 +3597,11 @@ async def stream_and_capture(
     finish_reason = None
     
     async with httpx.AsyncClient(timeout=300) as client:
-        async with client.stream("POST", API_BASE_URL, headers=headers, json=body) as response:
+        async with _open_upstream_stream(client, headers, body) as (response, used_model, open_failure):
+            if open_failure is not None:
+                yield _upstream_failure_sse(open_failure)
+                return
+            model = used_model
             # 打印上游响应头（排查thinking问题用）
             upstream_ct = response.headers.get("content-type", "")
             print(f"📨 上游响应: status={response.status_code}, content-type={upstream_ct}", flush=True)
@@ -5559,6 +5650,8 @@ async def get_settings():
             # 其他
             "FORCE_STREAM":       _parse_bool(db.get("FORCE_STREAM"), FORCE_STREAM),
             "REASONING_EFFORT":   db.get("REASONING_EFFORT") or str(REASONING_EFFORT),
+            "FALLBACK_MODELS":    db.get("FALLBACK_MODELS") if db.get("FALLBACK_MODELS") is not None else FALLBACK_MODELS,
+            "UPSTREAM_HEADER_TIMEOUT": int(db.get("UPSTREAM_HEADER_TIMEOUT") or UPSTREAM_HEADER_TIMEOUT),
 
             # System Prompt
             "systemPrompt": db.get("systemPrompt") or _DEFAULT_SYSTEM_PROMPT or "",
@@ -5602,6 +5695,8 @@ async def save_settings(request: Request):
             "CACHE_TTL":             str,
             "FORCE_STREAM":          lambda v: _parse_bool(v),
             "REASONING_EFFORT":      str,
+            "FALLBACK_MODELS":       lambda v: str(v or "").strip(),
+            "UPSTREAM_HEADER_TIMEOUT": lambda v: max(0, int(v or 0)),
         }
 
         # database.py 全局变量映射（开源版用 EMBEDDING_API_KEY + EMBEDDING_BASE_URL）
