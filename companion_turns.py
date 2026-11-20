@@ -51,8 +51,13 @@ def ends_with_model_turn(messages: list) -> bool:
     return False
 
 
+# A self-wake may phone instead of texting: "[来电] why". Kelivo turns that
+# into an incoming call, so like silence it is not a chat message.
+_CALL = re.compile(r"^\s*[\[【](来电|打电话|call)[\]】]", re.IGNORECASE)
+
+
 def is_silence(text: str) -> bool:
-    return bool(_SILENCE.match(text or ""))
+    return bool(_SILENCE.match(text or "")) or bool(_CALL.match(text or ""))
 
 
 def split_diary(text: str) -> tuple[str, list[str]]:

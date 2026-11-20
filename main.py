@@ -3529,9 +3529,9 @@ async def _call_turn(request: Request, body: dict, messages: list, call_id: str)
         call_mode.CONTEXTS.put(call_id, context)
 
     turns = call_mode.call_messages(m for m in messages if m.get("role") != "system")
-    if not turns or turns[-1]["role"] != "user":
+    if not call_mode.ends_awaiting_reply(turns):
         return JSONResponse(status_code=400, content={"error": {
-            "message": "A call turn must end with what the user said (or a hidden cue).",
+            "message": "A call turn must end with what the user said, a hidden cue, or tool results.",
             "type": "invalid_call_turn",
         }})
     latest = call_mode.latest_user_text(turns)
@@ -3539,6 +3539,7 @@ async def _call_turn(request: Request, body: dict, messages: list, call_id: str)
     if (
         MEMORY_ENABLED and MEMORY_EXTRACT_ENABLED and call_mode.TURN_MEMORIES > 0
         and latest and not companion_turns.is_proactive_cue(latest)
+        and turns[-1]["role"] == "user"
     ):
         try:
             mems = await search_memories_excluding(latest, call_mode.TURN_MEMORIES, context.memory_ids)
@@ -3555,6 +3556,13 @@ async def _call_turn(request: Request, body: dict, messages: list, call_id: str)
     body["messages"] = call_mode.build_messages(
         context, turns, build_time_injection(), turn_memory_text,
     )
+    if MEMORY_ENABLED and _request_has_tool(body, "search_memory"):
+        hint = call_mode.CALL_SEARCH_HINT
+        first = body["messages"][0] if body["messages"] else None
+        if first and first.get("role") == "system":
+            first["content"] = f"{first['content']}\n\n{hint}"
+        else:
+            body["messages"].insert(0, {"role": "system", "content": hint})
     model = body.get("model") or DEFAULT_MODEL
     body["model"] = model
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}

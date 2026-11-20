@@ -67,6 +67,20 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(merged[1]["content"], "嗯？\n怎么不说话")
         self.assertEqual(merged[2]["content"], "在呢")
 
+    def test_memory_lookup_turns_are_kept(self):
+        call = [
+            {"role": "user", "content": "我们上次说去哪"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "t1", "type": "function",
+             "function": {"name": "search_memory", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "t1", "content": "海边"},
+        ]
+        turns = call_mode.call_messages(call)
+        self.assertEqual([m["role"] for m in turns], ["user", "assistant", "tool"])
+        self.assertTrue(call_mode.ends_awaiting_reply(turns))
+        out = call_mode.build_messages(call_mode.CallContext("s", "sys"), turns, "[时间]", "")
+        self.assertEqual(out[-1]["role"], "tool")
+        self.assertEqual(out[1]["content"], "我们上次说去哪")
+
     def test_build_messages_puts_time_and_memories_on_the_last_line(self):
         ctx = call_mode.CallContext("s", "人设", ["之前聊了考研"],
                                     [{"role": "user", "content": "晚安"},

@@ -63,6 +63,7 @@ class CompanionTurnHelpersTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(companion_turns.is_proactive_cue("早安"))
         self.assertTrue(companion_turns.is_silence("  【静默】"))
         self.assertFalse(companion_turns.is_silence("今天好安静"))
+        self.assertTrue(companion_turns.is_silence("[来电] 想听听她的声音"))
         rest, diaries = companion_turns.split_diary("早呀\n[DIARY]\n她昨晚睡得晚\n[/DIARY]")
         self.assertEqual(rest, "早呀")
         self.assertEqual(diaries, ["她昨晚睡得晚"])

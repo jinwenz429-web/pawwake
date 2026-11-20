@@ -124,20 +124,33 @@ def recent_history(messages: Iterable[dict], rounds: int = RECENT_ROUNDS) -> lis
 
 
 def call_messages(messages: Iterable[dict]) -> list:
-    """Non-system messages of the call, with neighbouring same-role lines merged."""
+    """Non-system messages of the call.
+
+    Neighbouring plain user/assistant lines are merged. A memory lookup during
+    the call (assistant tool_calls + tool results) is kept exactly as sent.
+    """
     merged: list[dict] = []
     for message in messages:
         role = message.get("role")
+        if role == "tool" or (role == "assistant" and message.get("tool_calls")):
+            merged.append(dict(message))
+            continue
         if role not in ("user", "assistant"):
             continue
         text = _text_of(message.get("content")).strip()
         if not text:
             continue
-        if merged and merged[-1]["role"] == role:
-            merged[-1]["content"] = f"{merged[-1]['content']}\n{text}"
+        last = merged[-1] if merged else None
+        if last and last["role"] == role and not last.get("tool_calls"):
+            last["content"] = f"{last['content']}\n{text}"
         else:
             merged.append({"role": role, "content": text})
     return merged
+
+
+def ends_awaiting_reply(messages: list) -> bool:
+    """A call turn ends with the user (or a hidden cue) or with tool results."""
+    return bool(messages) and messages[-1].get("role") in ("user", "tool")
 
 
 def latest_user_text(messages: Iterable[dict]) -> str:
@@ -174,12 +187,21 @@ def build_messages(
         history.pop()
     result.extend(history)
     body = [dict(m) for m in call_msgs]
-    if body and body[-1]["role"] == "user":
+    last_user = max((i for i, m in enumerate(body) if m["role"] == "user"), default=None)
+    if last_user is not None and last_user == len(body) - 1:
         parts = [part for part in (time_text, turn_memory_text) if part]
         if parts:
-            body[-1]["content"] = "\n\n".join(parts + [body[-1]["content"]])
+            body[last_user]["content"] = "\n\n".join(parts + [body[last_user]["content"]])
     result.extend(body)
     return result
+
+
+CALL_SEARCH_HINT = (
+    "# 电话里查记忆\n"
+    "- 每句话网关已经自动带上了几条相关记忆，大多数时候直接聊就好。\n"
+    "- 真想不起来、或者要确认某个日期、某个约定时，可以调用 search_memory 去查；"
+    "查的时候对方会先听到一句垫话，所以别查个没完，一轮最多查一次。"
+)
 
 
 # ---------- transcript ----------
