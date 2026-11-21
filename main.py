@@ -186,6 +186,71 @@ def _partition_session_id_hash(session_id: str) -> str:
     return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:12]
 
 
+def repair_tool_turns(messages: list) -> list:
+    """让历史里每个 assistant(tool_calls) 后面紧跟的工具结果和调用一一对应。
+
+    DB 里可能有：孤立的 tool、重复的结果、缺了几条结果（客户端中途放弃、
+    并发请求只存了一半）。按调用 id 对齐：多的丢掉、重复的留最后一条、
+    缺的补一条「结果丢失」，顺序跟调用顺序一致。
+    """
+    repaired = []
+    orphans = duplicates = filled = 0
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        i += 1
+        if msg.get("role") == "tool":
+            orphans += 1
+            continue
+        repaired.append(msg)
+        calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+        if not calls:
+            continue
+        results = []
+        while i < len(messages) and messages[i].get("role") == "tool":
+            results.append(messages[i])
+            i += 1
+        by_id = {}
+        for result in results:
+            call_id = result.get("tool_call_id")
+            if call_id in by_id:
+                duplicates += 1
+            by_id[call_id] = result
+        ids = [call.get("id") for call in calls]
+        if all(ids):
+            orphans += sum(1 for call_id in by_id if call_id not in set(ids))
+            for call in calls:
+                result = by_id.get(call["id"])
+                if result is None:
+                    filled += 1
+                    result = {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "name": call.get("function", {}).get("name", ""),
+                        "content": json.dumps({
+                            "error": "tool_result_missing",
+                            "message": "This tool result was not recorded.",
+                        }),
+                    }
+                repaired.append(result)
+        else:
+            # 没有 id 只能按位置对：多的丢，少的补
+            ordered = results[:len(calls)]
+            orphans += max(0, len(results) - len(calls))
+            for index, call in enumerate(calls[len(ordered):], start=len(ordered)):
+                filled += 1
+                ordered.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id") or "",
+                    "name": call.get("function", {}).get("name", ""),
+                    "content": json.dumps({"error": "tool_result_missing"}),
+                })
+            repaired.extend(ordered)
+    if orphans or duplicates or filled:
+        print(f"⚠️ 修整工具轮次: 丢弃孤立/多余{orphans}条, 重复{duplicates}条, 补齐缺失{filled}条")
+    return repaired
+
+
 def _reconcile_current_tool_results(expected_tool_calls: list, client_tools: list) -> tuple:
     """Split stale results from a complete current assistant tool-call turn."""
     expected_ids = [tc.get("id") for tc in expected_tool_calls if tc.get("id")]
@@ -1610,23 +1675,8 @@ async def _build_partitioned_messages(
     if history and history[-1].get('role') == 'user':
         current_user_msg = history.pop()
     
-    # 清洗孤立的tool消息（前面不是 assistant(tool_calls) 或另一条 tool 的）
-    # 防止DB里的重复tool消息导致消息乱序
-    cleaned = []
-    orphan_count = 0
-    for msg in history:
-        if msg.get('role') == 'tool':
-            prev = cleaned[-1] if cleaned else None
-            if prev and (prev.get('role') == 'tool' or 
-                        (prev.get('role') == 'assistant' and prev.get('tool_calls'))):
-                cleaned.append(msg)
-            else:
-                orphan_count += 1
-        else:
-            cleaned.append(msg)
-    if orphan_count > 0:
-        print(f"⚠️ 清理了 {orphan_count} 条孤立tool消息")
-    history = cleaned
+    # 每个工具轮次的结果条数必须和调用条数一致（Gemini 不一致直接 400）
+    history = repair_tool_turns(history)
     
     # 按逻辑轮分组（解决tool消息导致的轮计数错乱）
     rounds = group_by_rounds(history)
